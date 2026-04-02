@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowmap"
+version = "0.1.0"
+description = "Cross-repo code intelligence (local index + Qdrant)"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai",
+    "qdrant-client",
+    "tqdm",
+    "python-dotenv",
+]
+
+[project.scripts]
+flowmap = "flowmap.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flowmap*"]

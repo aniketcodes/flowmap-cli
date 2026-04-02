@@ -1,0 +1,4 @@
+google-genai
+qdrant-client
+tqdm
+python-dotenv
