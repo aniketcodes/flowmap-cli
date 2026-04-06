@@ -1,129 +1,876 @@
-import argparse
-import os
-import sys
-import time
+"""FlowMap CLI — cross-repo code intelligence for LLMs."""
 
-from tqdm import tqdm
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+import click
 
 from flowmap.config import (
-    BATCH_SIZE,
-    EMBED_COOLDOWN_AFTER_429,
-    EMBED_INTER_BATCH_DELAY,
+    DEFAULT_CONFIG_PATH,
+    FlowmapConfig,
+    add_repo_to_config,
+    load_config,
+    remove_repo_from_config,
+    write_default_config,
 )
-from flowmap.indexer import index_repo
-from flowmap.embeddings import get_embedding, get_embeddings_batch
-from flowmap.store import ensure_collection, upsert_chunks, search
 
 
-def _resolve_repo_path(raw: str) -> str:
-    """Resolve a path for indexing; fixes common typo: Users/... vs /Users/..."""
-    raw = raw.strip()
-    expanded = os.path.expanduser(raw)
-    candidate = os.path.abspath(expanded)
-    if os.path.isdir(candidate):
-        return candidate
-    # macOS: absolute home path typed without leading slash
-    if raw.startswith("Users/") and os.path.isdir("/" + raw):
-        return "/" + raw
-    return candidate
-
-
-def cmd_index(args):
-    repo_path = _resolve_repo_path(args.path)
-    if not os.path.isdir(repo_path):
-        print(f"Error: not a directory: {args.path}")
-        print(f"Resolved path: {repo_path}")
-        print("Hint: use an absolute path, e.g. /Users/you/project (note the leading /).")
+def _load_cfg(ctx: click.Context) -> FlowmapConfig:
+    config_path = ctx.obj.get("config_path") if ctx.obj else None
+    try:
+        return load_config(config_path)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    print(f"Indexing: {repo_path}")
-    chunks = index_repo(repo_path)
-    if not chunks:
-        print("No supported files found (no matching extensions or empty files).")
-        print("See flowmap/config.py → SUPPORTED_EXTENSIONS")
+
+log = logging.getLogger(__name__)
+
+
+def _get_stored_dims(cfg: FlowmapConfig) -> int:
+    """Read stored embedding dims from StateDB, default 1024."""
+    from flowmap.state import StateDB
+    try:
+        with StateDB(cfg.db_path) as state:
+            stored = state.get_meta("embedding_dims")
+            return int(stored) if stored else 1024
+    except (sqlite3.DatabaseError, ValueError, OSError) as e:
+        log.warning("Could not read stored embedding dims: %s (defaulting to 1024)", e)
+        return 1024
+
+
+def _acquire_index_lock(lock_path: Path) -> int | None:
+    """Acquire advisory file lock. Returns fd on success, None if locked."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_index_lock(fd: int):
+    """Release advisory file lock."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+@click.group()
+@click.version_option(package_name="flowmap", prog_name="flowmap")
+@click.option("--config", "config_path", type=click.Path(exists=False), default=None, help="Path to config.yaml")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
+@click.option("--json-log", is_flag=True, help="Structured JSON logging (for pipelines)")
+@click.pass_context
+def main(ctx, config_path, verbose, json_log):
+    """FlowMap — cross-repo code intelligence CLI for LLMs."""
+    ctx.ensure_object(dict)
+    ctx.obj["config_path"] = Path(config_path) if config_path else None
+    if json_log:
+        import json as _json
+
+        class _JsonFormatter(logging.Formatter):
+            def format(self, record):
+                return _json.dumps({
+                    "ts": self.formatTime(record),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "msg": record.getMessage(),
+                })
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(_JsonFormatter())
+        logging.root.addHandler(handler)
+        logging.root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    elif verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(name)s %(levelname)s: %(message)s",
+        )
+    else:
+        # Default: show warnings and errors on stderr (no --verbose needed)
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(levelname)s: %(message)s",
+        )
+
+
+# ---------------------------------------------------------------------------
+# flowmap init
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.option("--force", is_flag=True, help="Overwrite existing config")
+@click.pass_context
+def init(ctx, force):
+    """Create a starter ~/.flowmap/config.yaml."""
+    config_path = ctx.obj.get("config_path")
+    try:
+        path = write_default_config(config_path, force=force)
+        click.echo(f"Created config: {path}")
+        click.echo("Edit it to add your repos, then run: flowmap repos add /path/to/repo")
+    except FileExistsError:
+        path = config_path or DEFAULT_CONFIG_PATH
+        click.echo(f"Config already exists: {path}")
+        click.echo("Use --force to overwrite, or just run: flowmap repos add /path/to/repo")
+
+
+# ---------------------------------------------------------------------------
+# flowmap repos
+# ---------------------------------------------------------------------------
+
+@main.group()
+def repos():
+    """Manage indexed repositories."""
+
+
+@repos.command("add")
+@click.argument("path", type=click.Path(exists=True, file_okay=False))
+@click.option("--name", default=None, help="Alias for the repo (default: directory name)")
+@click.pass_context
+def repos_add(ctx, path, name):
+    """Add a repository to the config."""
+    config_path = ctx.obj.get("config_path")
+    try:
+        repo = add_repo_to_config(path, name=name, config_path=config_path)
+        click.echo(f"Added: {repo.name} -> {repo.path}")
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+@repos.command("list")
+@click.pass_context
+def repos_list(ctx):
+    """List all configured repositories and their index status."""
+    cfg = _load_cfg(ctx)
+    if not cfg.repos:
+        click.echo("No repos configured. Run: flowmap repos add /path/to/repo")
         return
 
-    print(f"Found {len(chunks)} chunks")
+    from flowmap.state import StateDB
+    with StateDB(cfg.db_path) as state:
+        for repo in cfg.repos:
+            path_ok = repo.resolved_path().is_dir()
+            info = state.get_repo(repo.name)
+            if not path_ok:
+                marker = click.style("!", fg="red")
+                click.echo(f"  {marker} {repo.name:<28} path missing: {repo.path}")
+            elif info and info.get("last_indexed_at"):
+                status = click.style("indexed", fg="green")
+                chunks = info.get("chunk_count", 0)
+                when = info["last_indexed_at"][:10]
+                click.echo(f"    {repo.name:<28} {status}  {chunks:>6} chunks  {when}")
+            else:
+                status = click.style("not indexed", fg="yellow")
+                click.echo(f"    {repo.name:<28} {status}")
 
-    ensure_collection()
 
-    texts = [c["text"] for c in chunks]
-    n_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
-    print(
-        f"Generating embeddings: {len(texts)} chunks in {n_batches} batches "
-        f"(batch size {BATCH_SIZE}).",
-        flush=True,
-    )
-    print(
-        "The progress bar stays at 0% until the first batch returns — that call "
-        "often takes 30–120s (cold start). 429 rate limits add retries and longer waits.",
-        flush=True,
-    )
-    embeddings = []
-    for i in tqdm(
-        range(0, len(texts), BATCH_SIZE),
-        desc="Batches",
-        total=n_batches,
-        unit="batch",
-    ):
-        batch = texts[i : i + BATCH_SIZE]
-        batch_embs, had_429 = get_embeddings_batch(batch)
-        embeddings.extend(batch_embs)
-        if had_429 and EMBED_COOLDOWN_AFTER_429 > 0:
-            print(
-                f"Pausing {EMBED_COOLDOWN_AFTER_429:.0f}s after rate limits before the next batch...",
-                flush=True,
+@repos.command("paths")
+@click.pass_context
+def repos_paths(ctx):
+    """Output all repo paths (one per line, for use with rg)."""
+    cfg = _load_cfg(ctx)
+    for repo in cfg.repos:
+        click.echo(repo.resolved_path())
+
+
+@repos.command("remove")
+@click.argument("name")
+@click.option("--keep-data", is_flag=True, help="Remove from config but keep index data")
+@click.confirmation_option(prompt="Remove this repo from config and delete its index data?")
+@click.pass_context
+def repos_remove(ctx, name, keep_data):
+    """Remove a repository from config and delete its index data."""
+    config_path = ctx.obj.get("config_path")
+    cfg = _load_cfg(ctx)
+
+    # Check repo exists in config
+    matching = [r for r in cfg.repos if r.name == name]
+    if not matching:
+        click.echo(f"Repo '{name}' not found in config. Run 'flowmap repos list' to see configured repos.", err=True)
+        sys.exit(1)
+
+    # Delete index data unless --keep-data
+    if not keep_data:
+        from flowmap.state import StateDB
+        from flowmap.store import VectorStore
+        try:
+            with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+                store.delete_by_repo(name)
+                state.delete_repo(name)
+        except Exception as e:
+            click.echo(f"Warning: could not clean index data: {e}", err=True)
+
+    # Remove from config
+    removed = remove_repo_from_config(name, config_path=config_path)
+    if removed:
+        if keep_data:
+            click.echo(f"Removed '{name}' from config (index data kept).")
+        else:
+            click.echo(f"Removed '{name}' from config and deleted its index data.")
+    else:
+        click.echo(f"Could not remove '{name}' from config file.", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# flowmap index
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.option("--repo", default=None, help="Index a specific repo by name")
+@click.option("--full", is_flag=True, help="Force full re-index (ignore incremental)")
+@click.option("--dry-run", is_flag=True, help="Show what would be indexed without running")
+@click.pass_context
+def index(ctx, repo, full, dry_run):
+    """Index repositories for search."""
+    cfg = _load_cfg(ctx)
+    if not cfg.repos:
+        click.echo("No repos configured. Run: flowmap repos add /path/to/repo", err=True)
+        sys.exit(1)
+
+    targets = cfg.repos
+    if repo:
+        targets = [r for r in cfg.repos if r.name == repo]
+        if not targets:
+            resolved = Path(repo).expanduser().resolve()
+            targets = [r for r in cfg.repos if r.resolved_path() == resolved]
+        if not targets:
+            click.echo(f"Repo '{repo}' not found in config. Run: flowmap repos list", err=True)
+            sys.exit(1)
+
+    if dry_run:
+        from flowmap.config import SKIP_FILENAMES, SUPPORTED_EXTENSIONS
+        from flowmap.indexer import _git_tracked_files
+        from flowmap.reindex import get_git_status
+        from flowmap.state import StateDB
+        click.echo("Dry run — showing what would be indexed:\n")
+        with StateDB(cfg.db_path) as state:
+            for t in targets:
+                resolved = t.resolved_path()
+                if not resolved.is_dir():
+                    click.echo(f"  {t.name}: path missing ({resolved})")
+                    continue
+                git_status = get_git_status(str(resolved))
+                repo_info = state.get_repo(t.name)
+                stored_sha = repo_info.get("last_indexed_sha") if repo_info else None
+                if stored_sha and git_status and stored_sha == git_status.sha and not full:
+                    click.echo(f"  {t.name}: up to date ({git_status.branch}, {git_status.sha[:7]})")
+                else:
+                    mode = "full" if full or not stored_sha else "incremental"
+                    git_files = _git_tracked_files(str(resolved))
+                    if git_files is not None:
+                        supported = [f for f in git_files
+                                     if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS
+                                     and Path(f).name not in SKIP_FILENAMES]
+                        click.echo(f"  {t.name}: {mode} — {len(supported)} supported files in {resolved}")
+                    else:
+                        click.echo(f"  {t.name}: {mode} — not a git repo, cannot estimate")
+        return
+
+    from flowmap.embeddings import create_backend
+    from flowmap.services.indexing import run_index
+    from flowmap.state import StateDB
+    from flowmap.store import VectorStore
+
+    try:
+        backend = create_backend(
+            backend=cfg.embedding.backend,
+            model=cfg.embedding.model,
+            ollama_url=cfg.embedding.ollama_url,
+        )
+    except (ConnectionError, ValueError, ImportError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Embedding: {backend.model_name()} ({backend.dims()} dims)")
+
+    # Acquire process-level lock to prevent concurrent index corruption
+    lock_path = cfg.data_path / ".flowmap.lock"
+    lock_fd = _acquire_index_lock(lock_path)
+    if lock_fd is None:
+        click.echo("Error: another flowmap index is running. Wait or delete the lock file.", err=True)
+        sys.exit(1)
+
+    try:
+        with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=backend.dims()) as store:
+            # Check model consistency
+            stored_model = state.get_meta("embedding_model")
+            if stored_model and stored_model != backend.model_name():
+                if not full:
+                    click.echo(
+                        f"Error: model changed ({stored_model} -> {backend.model_name()}). "
+                        f"Run with --full to re-index.",
+                        err=True,
+                    )
+                    sys.exit(1)
+
+            run_index(
+                store=store,
+                state=state,
+                backend=backend,
+                targets=targets,
+                full=full,
+                on_message=lambda msg: click.echo(msg),
             )
-            time.sleep(EMBED_COOLDOWN_AFTER_429)
-        if i + BATCH_SIZE < len(texts) and EMBED_INTER_BATCH_DELAY > 0:
-            time.sleep(EMBED_INTER_BATCH_DELAY)
 
-    print("Storing in Qdrant...")
-    upsert_chunks(chunks, embeddings)
-    print(f"Done. Indexed {len(chunks)} chunks from {repo_path}")
-
-
-def cmd_ask(args):
-    query = args.query
-
-    query_vector = get_embedding(query)
-    results = search(query_vector, limit=args.limit, repo_filter=args.repo)
-
-    if not results:
-        print("No results found.")
-        return
-
-    for i, hit in enumerate(results, 1):
-        p = hit.payload
-        preview = p["text"].replace("\n", " ")[:200]
-        print(f"[{i}] {p['repo']}/{p['file']}  (score: {hit.score:.4f})")
-        print(f"    {preview}...")
-        print()
+            # Rebuild FTS and vector indexes once after all repos
+            click.echo("Rebuilding search indexes...")
+            store.rebuild_fts_index()
+            store.rebuild_vector_index()
+            store.compact()
+            click.echo("Done.")
+    finally:
+        _release_index_lock(lock_fd)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        prog="flowmap", description="Cross-repo code intelligence"
+# ---------------------------------------------------------------------------
+# flowmap search
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.argument("query")
+@click.option("--repo", default=None, help="Filter by repo name")
+@click.option("--limit", default=10, help="Number of results")
+@click.option("--mode", type=click.Choice(["hybrid", "semantic", "keyword", "symbol"]), default="hybrid")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--rerank", is_flag=True, default=False, help="Enable cross-encoder reranking (slower, higher quality)")
+@click.pass_context
+def search(ctx, query, repo, limit, mode, fmt, rerank):
+    """Search across indexed repositories."""
+    cfg = _load_cfg(ctx)
+
+    from flowmap.embeddings import create_backend
+    from flowmap.render import (
+        render_hybrid_results,
+        render_keyword_results,
+        render_semantic_results,
+        render_symbol_results,
     )
-    sub = parser.add_subparsers(dest="command")
+    from flowmap.store import StoreError, VectorStore
 
-    idx = sub.add_parser("index", help="Index a repository")
-    idx.add_argument("path", help="Path to the repository")
+    # Embedding backend needed for hybrid/semantic modes
+    backend = None
+    if mode in ("hybrid", "semantic"):
+        try:
+            backend = create_backend(
+                backend=cfg.embedding.backend,
+                model=cfg.embedding.model,
+                ollama_url=cfg.embedding.ollama_url,
+            )
+        except (ConnectionError, ValueError, ImportError) as e:
+            if mode == "hybrid":
+                click.echo(f"Warning: embedding unavailable ({e}), falling back to keyword-only.", err=True)
+                mode = "keyword"
+            else:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
 
-    ask = sub.add_parser("ask", help="Search the codebase")
-    ask.add_argument("query", help="Search query")
-    ask.add_argument("--limit", type=int, default=5, help="Number of results")
-    ask.add_argument("--repo", default=None, help="Filter by repo name")
+    # Get vector dims: from backend if available, else from stored metadata
+    if backend:
+        store_dims = backend.dims()
+    else:
+        store_dims = _get_stored_dims(cfg)
+    try:
+      with VectorStore(cfg.lancedb_path, vector_dims=store_dims) as store:
 
-    args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
+        # --- Hybrid mode (default): 3-way fusion ---
+        if mode == "hybrid":
+            from flowmap.search.hybrid import hybrid_search
+
+            repo_paths = cfg.repo_paths()
+            if repo:
+                repo_paths = {k: v for k, v in repo_paths.items() if k == repo}
+
+            results = hybrid_search(
+                query=query,
+                repo_paths=repo_paths,
+                embedding_backend=backend,
+                store=store,
+                limit=limit,
+                repo_filter=repo,
+                reranking_enabled=rerank or cfg.reranking.enabled,
+                reranking_model=cfg.reranking.model,
+            )
+
+            if not results:
+                click.echo("No results found.")
+                return
+            click.echo(render_hybrid_results(results, query, fmt))
+
+        # --- Semantic only ---
+        elif mode == "semantic":
+            query_vector = backend.embed_query(query)
+            results = store.search_vector(query_vector, limit=limit, repo_filter=repo)
+
+            if not results:
+                click.echo("No results found.")
+                return
+            click.echo(render_semantic_results(results, query, fmt))
+
+        # --- Symbol lookup ---
+        elif mode == "symbol":
+            results = store.search_symbol(query, repo_filter=repo, limit=limit)
+            if not results:
+                click.echo("No symbols found.")
+                return
+            click.echo(render_symbol_results(results, query, fmt))
+
+        # --- Keyword only (ripgrep) ---
+        elif mode == "keyword":
+            from flowmap.search.ripgrep import rg_search
+
+            repo_paths = cfg.repo_paths()
+            if repo:
+                repo_paths = {k: v for k, v in repo_paths.items() if k == repo}
+
+            results = rg_search(query, repo_paths, limit=limit)
+            if not results:
+                click.echo("No results found.")
+                return
+            click.echo(render_keyword_results(results))
+    except StoreError as e:
+        click.echo(f"Error: {e}", err=True)
+        click.echo("Try: flowmap index --full", err=True)
         sys.exit(1)
 
-    if args.command == "index":
-        cmd_index(args)
-    elif args.command == "ask":
-        cmd_ask(args)
+
+
+# ---------------------------------------------------------------------------
+# flowmap map
+# ---------------------------------------------------------------------------
+
+@main.command("map")
+@click.option("--repo", default=None, help="Show map for a specific repo")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.pass_context
+def repo_map(ctx, repo, fmt):
+    """Show structural overview of indexed repos."""
+    cfg = _load_cfg(ctx)
+
+    from flowmap.render import render_map
+    from flowmap.services.map_builder import build_repo_map
+    from flowmap.store import StoreError, VectorStore
+
+    try:
+        with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+            rows, truncated = store.get_repo_map(repo=repo)
+
+            if not rows:
+                if repo:
+                    click.echo(f"No indexed data for repo '{repo}'. Run: flowmap index --repo {repo}")
+                else:
+                    click.echo("No indexed data. Run: flowmap index")
+                return
+
+            if truncated:
+                click.echo("Warning: results truncated at 50,000 entries. Use --repo to filter.", err=True)
+
+            output_repos = build_repo_map(rows)
+            click.echo(render_map(output_repos, fmt))
+    except StoreError as e:
+        click.echo(f"Error: {e}", err=True)
+        click.echo("Try: flowmap index --full", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# flowmap symbols
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.argument("query", required=False, default=None)
+@click.option("--repo", default=None, help="Filter by repo name")
+@click.option("--type", "kind", default=None, type=click.Choice(["class", "function", "method", "property"]), help="Filter by symbol type")
+@click.option("--limit", default=50, help="Max results")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.pass_context
+def symbols(ctx, query, repo, kind, limit, fmt):
+    """List symbols across indexed repos."""
+    cfg = _load_cfg(ctx)
+
+    from flowmap.render import render_symbols
+    from flowmap.store import StoreError, VectorStore
+
+    try:
+        with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+            rows = store.get_symbols(query=query, repo=repo, kind=kind, limit=limit)
+
+            if not rows:
+                click.echo("No symbols found.")
+                return
+
+            click.echo(render_symbols(rows, query, fmt))
+    except StoreError as e:
+        click.echo(f"Error: {e}", err=True)
+        click.echo("Try: flowmap index --full", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# flowmap cat
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.argument("file_path")
+@click.option("--repo", default=None, help="Repo name (auto-detected if file path is inside a configured repo)")
+@click.option("--lines", default=None, help="Line range, e.g. '10-50' or '42'")
+@click.option("--symbol", default=None, help="Show the chunk containing this symbol name")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.pass_context
+def cat(ctx, file_path, repo, lines, symbol, fmt):
+    """Read file content from a configured repo.
+
+    Show full source code for files found via search/symbols.
+    Supports line ranges and symbol-based lookup.
+
+    \b
+    Examples:
+      flowmap cat zed-dispatch-service/src/dispatch.service.ts
+      flowmap cat src/auth.py --repo my-service --lines 25-70
+      flowmap cat src/service.ts --repo my-service --symbol processTaxiDispatch
+      flowmap cat zed-dispatch-service/src/workflow.ts --format json
+    """
+    cfg = _load_cfg(ctx)
+    import json as json_mod
+
+    from flowmap.services.file_resolver import resolve_file
+    from flowmap.services.symbol_lookup import get_symbol_suggestions, resolve_symbol
+
+    # Resolve the file to a repo
+    try:
+        resolved = resolve_file(file_path, cfg.repos, explicit_repo=repo)
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    repo_cfg = resolved.repo_cfg
+    repo_root = resolved.repo_root
+    abs_file = resolved.abs_file
+    rel = resolved.rel_file
+
+    if not abs_file.exists():
+        click.echo(f"File not found: {abs_file}", err=True)
+        sys.exit(1)
+
+    # If --symbol, find the chunk and show its line range
+    if symbol:
+        from flowmap.store import StoreError, VectorStore
+
+        try:
+            with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+                match = resolve_symbol(symbol, repo_cfg.name, rel, store)
+
+                if not match:
+                    suggestions = get_symbol_suggestions(repo_cfg.name, rel, store)
+                    click.echo(f"Symbol '{symbol}' not found in {rel}.", err=True)
+                    if suggestions:
+                        click.echo(f"  Available symbols: {', '.join(suggestions)}", err=True)
+                    else:
+                        click.echo("  Try without --symbol to read the full file.", err=True)
+                    sys.exit(1)
+
+                lines = f"{match.result.start_line}-{match.result.end_line}"
+                click.echo(f"# {match.result.symbol_name} at {match.result.repo}/{match.result.file}:{match.result.start_line}-{match.result.end_line}", err=True)
+        except StoreError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+    # Read the file
+    try:
+        content = abs_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError as e:
+        click.echo(f"Error reading file: {e}", err=True)
+        sys.exit(1)
+
+    file_lines = content.splitlines()
+
+    # Apply line range
+    if lines:
+        try:
+            if "-" in lines:
+                parts = lines.split("-", 1)
+                start = max(1, int(parts[0]))
+                end = min(len(file_lines), int(parts[1]))
+            else:
+                start = max(1, int(lines))
+                end = min(len(file_lines), start + 50)  # default: 50 lines from start
+        except ValueError:
+            click.echo(f"Invalid line range '{lines}'. Use format: 10-50 or 42", err=True)
+            sys.exit(1)
+
+        selected = file_lines[start - 1:end]
+
+        if fmt == "json":
+            output = {
+                "repo": repo_cfg.name,
+                "file": rel,
+                "start_line": start,
+                "end_line": end,
+                "content": "\n".join(selected),
+            }
+            click.echo(json_mod.dumps(output, indent=2))
+        else:
+            for i, line in enumerate(selected, start):
+                click.echo(f"{i:>4}  {line}")
+    else:
+        if fmt == "json":
+            output = {
+                "repo": repo_cfg.name,
+                "file": rel,
+                "start_line": 1,
+                "end_line": len(file_lines),
+                "content": content,
+            }
+            click.echo(json_mod.dumps(output, indent=2))
+        else:
+            for i, line in enumerate(file_lines, 1):
+                click.echo(f"{i:>4}  {line}")
+
+
+# ---------------------------------------------------------------------------
+# flowmap history
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.argument("query")
+@click.option("--since", default="6 months ago", help="Time window (e.g. '3 months ago', '2025-01-01')")
+@click.option("--repo", default=None, help="Filter by repo name")
+@click.option("--limit", default=20, help="Max timeline entries")
+@click.option("--symbol", default=None, help="Focus on a specific symbol name")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.pass_context
+def history(ctx, query, since, repo, limit, symbol, fmt):
+    """Show timeline of structural changes for a query.
+
+    Scopes to relevant files via flowmap's index, then queries git history
+    and compares versions with tree-sitter for AST-level diffs.
+
+    \b
+    Examples:
+      flowmap history "validateToken"
+      flowmap history "payment" --repo payment-service --since "3 months ago"
+      flowmap history "OrderProcessor" --symbol OrderProcessor.process --limit 10
+    """
+    cfg = _load_cfg(ctx)
+
+    from flowmap.history.timeline import build_timeline
+    from flowmap.render import render_timeline
+    from flowmap.store import StoreError, VectorStore
+
+    try:
+        with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+            timeline = build_timeline(
+                query=query,
+                repo_paths=cfg.repo_paths(),
+                store=store,
+                since=since,
+                limit=limit,
+                repo_filter=repo,
+                symbol_filter=symbol,
+            )
+    except StoreError as e:
+        click.echo(f"Error: {e}", err=True)
+        click.echo("Try: flowmap index --full", err=True)
+        sys.exit(1)
+
+    if not timeline.entries:
+        click.echo(f"No history found for '{query}'.")
+        if not timeline.scoped_files:
+            click.echo("  No matching files in the index. Try a different query or run: flowmap index")
+        return
+
+    click.echo(render_timeline(timeline, fmt))
+
+
+# ---------------------------------------------------------------------------
+# flowmap status
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.pass_context
+def status(ctx):
+    """Show index status for all repos."""
+    cfg = _load_cfg(ctx)
+    if not cfg.repos:
+        click.echo("No repos configured. Run: flowmap repos add /path/to/repo")
+        return
+
+    from flowmap.state import StateDB
+    from flowmap.store import VectorStore
+
+    with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+        stats = store.get_stats(known_repos=[r.name for r in cfg.repos])
+        click.echo(f"Index: {stats['total']} total chunks\n")
+
+        for repo in cfg.repos:
+            info = state.get_repo(repo.name)
+            path_exists = repo.resolved_path().is_dir()
+
+            if not path_exists:
+                marker = click.style("!", fg="red")
+                click.echo(f"  {marker} {repo.name:<28} path missing: {repo.path}")
+            elif info and info.get("last_indexed_at"):
+                marker = click.style("✓", fg="green")
+                chunks = stats.get("repos", {}).get(repo.name, 0)
+                sha = (info.get("last_indexed_sha") or "")[:7]
+                branch = info.get("last_indexed_branch") or ""
+                when = info["last_indexed_at"][:10]
+                branch_str = f"{branch}, " if branch else ""
+                click.echo(f"  {marker} {repo.name:<28} {chunks:>6} chunks  {when}  ({branch_str}{sha})")
+            else:
+                marker = click.style("✗", fg="yellow")
+                click.echo(f"  {marker} {repo.name:<28} not indexed")
+
+
+# ---------------------------------------------------------------------------
+# flowmap reset
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.option("--repo", default=None, help="Reset a specific repo")
+@click.option("--all", "reset_all", is_flag=True, help="Reset everything")
+@click.option("--benchmarks", is_flag=True, help="Remove benchmark profiles only")
+@click.confirmation_option(prompt="This will delete index data. Continue?")
+@click.pass_context
+def reset(ctx, repo, reset_all, benchmarks):
+    """Delete index data."""
+    cfg = _load_cfg(ctx)
+
+    from flowmap.state import StateDB
+    from flowmap.store import VectorStore
+
+    with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+        if benchmarks:
+            for profile in store.list_profiles():
+                if profile != "default":
+                    store.drop_table(profile)
+                    click.echo(f"Dropped benchmark profile: {profile}")
+        elif repo:
+            store.delete_by_repo(repo)
+            state.delete_repo(repo)
+            click.echo(f"Reset: {repo}")
+        elif reset_all:
+            for profile in store.list_profiles():
+                store.drop_table(profile)
+            for r in state.list_repos():
+                state.delete_repo(r["name"])
+            click.echo("Reset: all index data deleted.")
+        else:
+            click.echo("Specify --repo, --all, or --benchmarks.", err=True)
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# flowmap doctor
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.pass_context
+def doctor(ctx):
+    """Check system health: repos, index, embedding backend, dependencies."""
+    cfg = _load_cfg(ctx)
+    import shutil
+
+    ok = True
+
+    # 1. Check repos
+    click.echo("Repos:")
+    if not cfg.repos:
+        click.echo("  No repos configured. Run: flowmap repos add /path/to/repo")
+        ok = False
+    else:
+        for repo in cfg.repos:
+            if repo.resolved_path().is_dir():
+                click.echo(f"  {click.style('OK', fg='green')}  {repo.name} -> {repo.path}")
+            else:
+                click.echo(f"  {click.style('MISSING', fg='red')}  {repo.name} -> {repo.path}")
+                ok = False
+
+    # 2. Check embedding backend
+    click.echo("\nEmbedding backend:")
+    try:
+        from flowmap.embeddings import create_backend
+        backend = create_backend(
+            backend=cfg.embedding.backend,
+            model=cfg.embedding.model,
+            ollama_url=cfg.embedding.ollama_url,
+        )
+        backend_dims = backend.dims()
+        click.echo(f"  {click.style('OK', fg='green')}  {backend.model_name()} ({backend_dims} dims)")
+    except (ConnectionError, ValueError, ImportError) as e:
+        click.echo(f"  {click.style('ERROR', fg='red')}  {e}")
+        ok = False
+        backend_dims = None
+
+    # 3. Check ripgrep
+    click.echo("\nDependencies:")
+    if shutil.which("rg"):
+        click.echo(f"  {click.style('OK', fg='green')}  ripgrep (rg) installed")
+    else:
+        click.echo(f"  {click.style('MISSING', fg='yellow')}  ripgrep (rg) not installed — keyword search disabled")
+
+    # 4. Check index state
+    click.echo("\nIndex:")
+    from flowmap.state import StateDB
+    from flowmap.store import VectorStore
+    try:
+        with StateDB(cfg.db_path) as state:
+            stored_model = state.get_meta("embedding_model")
+            stored_dims = state.get_meta("embedding_dims")
+            if stored_model:
+                click.echo(f"  Model: {stored_model} ({stored_dims or '?'} dims)")
+                if stored_dims and backend_dims and int(stored_dims) != backend_dims:
+                    click.echo(f"  {click.style('WARN', fg='yellow')}  Dimension mismatch: stored={stored_dims}, current={backend_dims}. Run: flowmap index --full")
+                    ok = False
+            else:
+                click.echo(f"  {click.style('EMPTY', fg='yellow')}  No index data. Run: flowmap index")
+                ok = False
+
+            # Check for pending markers
+            for repo in cfg.repos:
+                pending = state.get_meta(f"pending:{repo.name}")
+                if pending:
+                    click.echo(f"  {click.style('WARN', fg='yellow')}  {repo.name}: interrupted index detected (will re-index on next run)")
+
+        with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+            stats = store.get_stats(known_repos=[r.name for r in cfg.repos])
+            click.echo(f"  Total chunks: {stats['total']}")
+            for rname, count in stats.get("repos", {}).items():
+                click.echo(f"    {rname}: {count} chunks")
+    except Exception as e:
+        click.echo(f"  {click.style('ERROR', fg='red')}  {e}")
+        ok = False
+
+    # Summary
+    click.echo()
+    if ok:
+        click.echo(click.style("All checks passed.", fg="green"))
+    else:
+        click.echo(click.style("Some checks failed. See above.", fg="red"))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

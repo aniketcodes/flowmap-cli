@@ -1,82 +1,668 @@
-import uuid
+"""LanceDB vector store for FlowMap — profile-scoped tables, deterministic IDs."""
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-)
+from __future__ import annotations
 
-from flowmap.config import QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, EMBEDDING_DIMS
+import hashlib
+import logging
+from dataclasses import dataclass
+from pathlib import Path
 
-_client = None
+import lancedb
+import pyarrow as pa
 
 
-def _get_client() -> QdrantClient:
-    global _client
-    if _client is None:
-        _client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    return _client
+log = logging.getLogger(__name__)
 
 
-def ensure_collection():
-    client = _get_client()
-    collections = [c.name for c in client.get_collections().collections]
-    if COLLECTION_NAME not in collections:
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(
-                size=EMBEDDING_DIMS,
-                distance=Distance.COSINE,
-            ),
-        )
+class StoreError(Exception):
+    """Raised when a store query fails unexpectedly.
+
+    Callers should catch this and show a diagnostic message rather than
+    letting users see 'No results found' when their index is broken.
+    """
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+def _make_schema(vector_dims: int) -> pa.Schema:
+    """Create PyArrow schema with a fixed-size vector column."""
+    return pa.schema([
+        pa.field("id", pa.string()),
+        pa.field("repo", pa.string()),
+        pa.field("file", pa.string()),
+        pa.field("file_name", pa.string()),
+        pa.field("extension", pa.string()),
+        pa.field("language", pa.string()),
+        pa.field("chunk_type", pa.string()),
+        pa.field("symbol_name", pa.string()),
+        pa.field("signature", pa.string()),
+        pa.field("parent_symbol", pa.string()),
+        pa.field("parent_signature", pa.string()),
+        pa.field("start_line", pa.int32()),
+        pa.field("end_line", pa.int32()),
+        pa.field("chunk_index", pa.int32()),
+        pa.field("text", pa.string()),
+        pa.field("vector", pa.list_(pa.float32(), list_size=vector_dims)),
+    ])
 
 
-def upsert_chunks(chunks: list[dict], embeddings: list[list[float]]):
-    client = _get_client()
-    points = [
-        PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
+@dataclass
+class SearchResult:
+    """Store-agnostic search result — no LanceDB internals leak.
+
+    score: higher is better (similarity, not distance).
+    """
+    repo: str
+    file: str
+    start_line: int
+    end_line: int
+    text: str
+    symbol_name: str
+    chunk_type: str
+    signature: str
+    parent_symbol: str
+    parent_signature: str
+    language: str
+    score: float
+
+
+# ---------------------------------------------------------------------------
+# Deterministic IDs
+# ---------------------------------------------------------------------------
+
+def make_chunk_id(
+    repo: str, file: str, symbol_name: str, chunk_type: str, chunk_index: int,
+) -> str:
+    """Content-based deterministic ID.
+
+    - Symbol chunks: sha256(repo:file:symbol_name:chunk_index) — includes
+      chunk_index as disambiguator for overloaded methods / same-named symbols.
+    - Non-symbol chunks: sha256(repo:file:chunk_type:chunk_index)
+    """
+    if symbol_name:
+        raw = f"{repo}:{file}:{symbol_name}:{chunk_index}"
+    else:
+        raw = f"{repo}:{file}:{chunk_type}:{chunk_index}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Store
+# ---------------------------------------------------------------------------
+
+def _escape_sql(value: str) -> str:
+    """Escape special characters for LanceDB SQL equality predicates."""
+    return value.replace("\\", "\\\\").replace("'", "''")
+
+
+def _escape_like(value: str) -> str:
+    """Escape for LIKE patterns — quote-safe AND wildcard-safe.
+
+    Escapes single quotes (for SQL safety) plus % and _ (LIKE wildcards).
+    Python-side filtering provides defense-in-depth.
+    """
+    return _escape_sql(value).replace("%", "\\%").replace("_", "\\_")
+
+
+
+class VectorStore:
+    """LanceDB-backed vector store with profile-scoped tables."""
+
+    def __init__(self, db_path: str | Path, vector_dims: int = 1024):
+        self._db_path = Path(db_path)
+        self._db_path.mkdir(parents=True, exist_ok=True)
+        self._db = lancedb.connect(str(self._db_path))
+        self._vector_dims = vector_dims
+        self._table_names_cache: list[str] | None = None
+        self._dims_validated: set[str] = set()
+
+    def close(self):
+        """Explicit cleanup."""
+        pass  # LanceDB connections are lightweight; no explicit close needed
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _list_table_names(self) -> list[str]:
+        """Get table names with caching. Invalidated on create/drop."""
+        if self._table_names_cache is not None:
+            return self._table_names_cache
+        result = self._db.list_tables()
+        # list_tables() returns ListTablesResponse with .tables attribute
+        if hasattr(result, "tables"):
+            self._table_names_cache = result.tables
+        else:
+            self._table_names_cache = list(result)
+        return self._table_names_cache
+
+    def _invalidate_table_cache(self):
+        self._table_names_cache = None
+
+    def _validate_dims(self, table, profile: str = "default"):
+        """Check table vector dims match configured dims. Raises StoreError on mismatch."""
+        if profile in self._dims_validated:
+            return
+        try:
+            schema = table.schema
+            vec_field = schema.field("vector")
+            table_dims = vec_field.type.list_size
+            if table_dims != self._vector_dims:
+                raise StoreError(
+                    f"Dimension mismatch: index has {table_dims}-dim vectors but "
+                    f"current model produces {self._vector_dims}-dim. "
+                    f"Run: flowmap index --full"
+                )
+        except StoreError:
+            raise
+        except Exception:
+            pass  # schema introspection not critical — skip validation
+        self._dims_validated.add(profile)
+
+    def _table_name(self, profile: str = "default") -> str:
+        if profile == "default":
+            return "code_index"
+        return f"code_index__{profile}"
+
+    def _get_or_create_table(self, profile: str = "default"):
+        name = self._table_name(profile)
+        if name in self._list_table_names():
+            return self._db.open_table(name)
+        table = self._db.create_table(name, schema=_make_schema(self._vector_dims))
+        self._invalidate_table_cache()
+        self._create_indexes(table)
+        return table
+
+    def _create_indexes(self, table):
+        """Create vector, scalar, and FTS indexes. Safe to call multiple times.
+
+        LanceDB raises generic Exception when an index already exists — no
+        specific exception type is available, so we catch broadly here.
+        """
+        for col in ("repo", "symbol_name", "chunk_type"):
+            try:
+                table.create_scalar_index(col)
+            except Exception as e:
+                log.debug("Scalar index on %s already exists or failed: %s", col, e)
+
+    def rebuild_fts_index(self, profile: str = "default"):
+        """Rebuild the full-text search index. Call after all upserts are done, not per-repo."""
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+        table = self._db.open_table(name)
+        try:
+            table.create_fts_index("text", replace=True)
+        except Exception as e:
+            log.debug("FTS index rebuild skipped: %s", e)
+
+    def rebuild_vector_index(self, profile: str = "default"):
+        """Rebuild the IVF-PQ vector index. Call after all upserts are done.
+
+        Only creates the index if the table has enough rows (>= 5000) for IVF
+        to be meaningful. Below that threshold, brute-force scan is fast enough.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+        table = self._db.open_table(name)
+        try:
+            count = table.count_rows()
+            if count < 5000:
+                log.debug("Skipping vector index: %d rows (need >= 5000)", count)
+                return
+            # Scale partitions with table size: sqrt(n), clamped to [16, 512]
+            num_partitions = max(16, min(512, int(count ** 0.5)))
+            table.create_index(
+                metric="cosine",
+                num_partitions=num_partitions,
+                num_sub_vectors=min(96, self._vector_dims // 8),
+                vector_column_name="vector",
+                replace=True,
+            )
+            log.info("Vector index rebuilt: %d rows, %d partitions", count, num_partitions)
+        except Exception as e:
+            log.debug("Vector index rebuild skipped: %s", e)
+
+    # -- write operations ----------------------------------------------------
+
+    def upsert_chunks(
+        self,
+        chunks: list[dict],
+        embeddings: list[list[float]],
+        profile: str = "default",
+    ):
+        """Insert or overwrite chunks by ID."""
+        if not chunks:
+            return
+        if len(chunks) != len(embeddings):
+            raise ValueError(
+                f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) must have equal length"
+            )
+
+        table = self._get_or_create_table(profile)
+
+        records = []
+        for chunk, vector in zip(chunks, embeddings):
+            records.append({
+                "id": chunk["id"],
                 "repo": chunk["repo"],
                 "file": chunk["file"],
                 "file_name": chunk["file_name"],
                 "extension": chunk["extension"],
-                "chunk_index": chunk["chunk_index"],
+                "language": chunk.get("language", ""),
+                "chunk_type": chunk.get("chunk_type", "fallback"),
+                "symbol_name": chunk.get("symbol_name", ""),
+                "signature": chunk.get("signature", ""),
+                "parent_symbol": chunk.get("parent_symbol", ""),
+                "parent_signature": chunk.get("parent_signature", ""),
+                "start_line": chunk.get("start_line", 0),
+                "end_line": chunk.get("end_line", 0),
+                "chunk_index": chunk.get("chunk_index", 0),
                 "text": chunk["text"],
-            },
+                "vector": vector,
+            })
+
+        table.merge_insert("id") \
+            .when_matched_update_all() \
+            .when_not_matched_insert_all() \
+            .execute(records)
+
+        # Note: FTS index rebuild moved to rebuild_fts_index() — call once after all upserts
+
+    def delete_by_repo(self, repo: str, profile: str = "default"):
+        """Delete all chunks for a repo."""
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+        table = self._db.open_table(name)
+        table.delete(f"repo = '{_escape_sql(repo)}'")
+
+    def delete_by_file(self, repo: str, file: str, profile: str = "default"):
+        """Delete all chunks for a specific file in a repo."""
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+        table = self._db.open_table(name)
+        table.delete(f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(file)}'")
+
+    def delete_stale_files(self, repo: str, current_files: set[str], profile: str = "default"):
+        """Delete chunks for files no longer present in the repo.
+
+        Used after upsert-first full reindex to clean up stale data without
+        a delete-everything-first approach (which has a data-loss window).
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+
+        try:
+            table = self._db.open_table(name)
+            # Get distinct files currently stored for this repo
+            rows = table.search().select(["file"]).where(
+                f"repo = '{_escape_sql(repo)}'"
+            ).limit(100000).to_list()
+            stored_files = {r["file"] for r in rows}
+
+            stale_files = stored_files - current_files
+            for f in stale_files:
+                table.delete(f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(f)}'")
+            if stale_files:
+                log.info("Deleted %d stale files for repo %s", len(stale_files), repo)
+        except Exception as e:
+            log.warning("delete_stale_files failed for %s: %s (stale chunks may remain)", repo, e)
+
+    def delete_stale_chunks(self, repo: str, file: str, valid_ids: set[str], profile: str = "default"):
+        """Delete chunks for a specific file whose IDs are not in the valid set.
+
+        Used after upsert-first incremental reindex: new chunks are upserted via
+        merge_insert, then this cleans up stale IDs (removed symbols, reordered chunks).
+        If crash occurs before this runs, stale chunks remain but no data is lost.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+
+        try:
+            table = self._db.open_table(name)
+            rows = table.search().select(["id"]).where(
+                f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(file)}'"
+            ).limit(10000).to_list()
+            stale_ids = [r["id"] for r in rows if r["id"] not in valid_ids]
+            for sid in stale_ids:
+                table.delete(f"id = '{_escape_sql(sid)}'")
+            if stale_ids:
+                log.debug("Deleted %d stale chunks for %s/%s", len(stale_ids), repo, file)
+        except Exception as e:
+            log.warning("delete_stale_chunks failed for %s/%s: %s", repo, file, e)
+
+    # -- search operations ---------------------------------------------------
+
+    def search_vector(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        repo_filter: str | None = None,
+        profile: str = "default",
+    ) -> list[SearchResult]:
+        """Cosine similarity search. Returns results with score: higher = better.
+
+        Raises StoreError on query failure or dimension mismatch.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return []
+
+        try:
+            table = self._db.open_table(name)
+            self._validate_dims(table, profile)
+            query = table.search(query_vector, vector_column_name="vector").limit(limit)
+
+            if repo_filter:
+                query = query.where(f"repo = '{_escape_sql(repo_filter)}'")
+
+            results = query.to_list()
+            return [self._row_to_result(r) for r in results]
+        except StoreError:
+            raise
+        except Exception as e:
+            raise StoreError(f"Vector search failed: {e}") from e
+
+    def search_symbol(
+        self,
+        symbol_name: str,
+        repo_filter: str | None = None,
+        file_filter: str | None = None,
+        limit: int = 10,
+        profile: str = "default",
+    ) -> list[SearchResult]:
+        """Search by symbol name — exact match, suffix match (.Name), and contains match.
+
+        If file_filter is provided, results are scoped to that file path only.
+        Raises StoreError on query failure.
+
+        LIKE patterns use _escape_sql (quote-safe only). Underscore and percent
+        act as SQL wildcards in the LIKE — Python-side filtering ensures correctness.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return []
+
+        try:
+            table = self._db.open_table(name)
+            safe_sym = _escape_sql(symbol_name)
+            repo_clause = f" AND repo = '{_escape_sql(repo_filter)}'" if repo_filter else ""
+            file_clause = f" AND file = '{_escape_sql(file_filter)}'" if file_filter else ""
+
+            results: list[SearchResult] = []
+
+            # 1. Exact match (score 1.0) — uses = not LIKE, no wildcard issue
+            rows = table.search().where(f"symbol_name = '{safe_sym}'{repo_clause}{file_clause}").limit(limit).to_list()
+            for r in rows:
+                sr = self._row_to_result(r)
+                sr.score = 1.0
+                results.append(sr)
+
+            # 2. Suffix match — "Process" matches "Service.Process" (score 0.8)
+            # LIKE fetches candidates broadly; Python filter ensures exact suffix
+            if len(results) < limit:
+                safe_sym_like = _escape_like(symbol_name)
+                suffix_where = f"symbol_name LIKE '%.{safe_sym_like}' ESCAPE '\\'{repo_clause}{file_clause}"
+                rows = table.search().where(suffix_where).limit(limit * 3).to_list()
+                seen = {(r.repo, r.file, r.start_line) for r in results}
+                for r in rows:
+                    if not r.get("symbol_name", "").endswith(f".{symbol_name}"):
+                        continue
+                    sr = self._row_to_result(r)
+                    key = (sr.repo, sr.file, sr.start_line)
+                    if key not in seen:
+                        sr.score = 0.8
+                        results.append(sr)
+                        seen.add(key)
+
+            # 3. Contains match — "validate" matches "AuthService.validate_token" (score 0.5)
+            # LIKE fetches candidates broadly; Python filter ensures exact containment
+            if len(results) < limit:
+                safe_sym_like = _escape_like(symbol_name)
+                contains_where = f"symbol_name LIKE '%{safe_sym_like}%' ESCAPE '\\'{repo_clause}{file_clause}"
+                rows = table.search().where(contains_where).limit(limit * 3).to_list()
+                seen = {(r.repo, r.file, r.start_line) for r in results}
+                for r in rows:
+                    if symbol_name not in r.get("symbol_name", ""):
+                        continue
+                    sr = self._row_to_result(r)
+                    key = (sr.repo, sr.file, sr.start_line)
+                    if key not in seen:
+                        sr.score = 0.5
+                        results.append(sr)
+                        seen.add(key)
+
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results
+        except StoreError:
+            raise
+        except Exception as e:
+            raise StoreError(f"Symbol search failed: {e}") from e
+
+    def find_chunk_containing(
+        self,
+        repo: str,
+        file: str,
+        line: int,
+        profile: str = "default",
+    ) -> SearchResult | None:
+        """Find the chunk that contains a given line number.
+
+        Used by hybrid search to map ripgrep line hits to stored chunks
+        for dedup-before-scoring.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return None
+
+        table = self._db.open_table(name)
+        where = (
+            f"repo = '{_escape_sql(repo)}' AND "
+            f"file = '{_escape_sql(file)}' AND "
+            f"start_line <= {int(line)} AND "
+            f"end_line >= {int(line)}"
         )
-        for chunk, embedding in zip(chunks, embeddings)
-    ]
 
-    batch_size = 100
-    for i in range(0, len(points), batch_size):
-        client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points[i : i + batch_size],
+        try:
+            rows = table.search().where(where).limit(10).to_list()
+        except Exception as e:
+            raise StoreError(f"find_chunk_containing failed: {e}") from e
+
+        if not rows:
+            return None
+
+        # Prefer the most specific (smallest span) chunk when overlapping
+        rows.sort(key=lambda r: r.get("end_line", 0) - r.get("start_line", 0))
+        return self._row_to_result(rows[0])
+
+    def get_chunks_for_file(
+        self,
+        repo: str,
+        file: str,
+        profile: str = "default",
+    ) -> list[SearchResult]:
+        """Get all chunks for a specific file. Returns chunks sorted by start_line.
+
+        Used by hybrid search for batch ripgrep-to-chunk mapping — one query per
+        unique file instead of one per ripgrep hit.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return []
+
+        table = self._db.open_table(name)
+        where = f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(file)}'"
+
+        try:
+            rows = table.search().where(where).limit(1000).to_list()
+            chunks = [self._row_to_result(r) for r in rows]
+            chunks.sort(key=lambda c: c.start_line)
+            return chunks
+        except Exception as e:
+            raise StoreError(f"get_chunks_for_file failed for {repo}/{file}: {e}") from e
+
+    # -- stats ---------------------------------------------------------------
+
+    def get_stats(self, profile: str = "default", known_repos: list[str] | None = None) -> dict:
+        """Return chunk counts grouped by repo. Uses per-repo count_rows to avoid loading full table."""
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return {"total": 0, "repos": {}}
+
+        table = self._db.open_table(name)
+        total = table.count_rows()
+        if total == 0:
+            return {"total": 0, "repos": {}}
+
+        repo_counts: dict[str, int] = {}
+        if known_repos:
+            for repo in known_repos:
+                try:
+                    count = table.count_rows(f"repo = '{_escape_sql(repo)}'")
+                    if count > 0:
+                        repo_counts[repo] = count
+                except Exception as e:
+                    log.debug("get_stats count_rows failed for %s: %s", repo, e)
+        else:
+            # Fallback: read just repo column (lighter than full table)
+            try:
+                rows = table.search().select(["repo"]).limit(min(total, 100000)).to_list()
+                from collections import Counter
+                repo_counts = dict(Counter(r["repo"] for r in rows))
+            except Exception as e:
+                log.debug("get_stats repo enumeration failed: %s", e)
+
+        return {"total": total, "repos": repo_counts}
+
+    # -- map & symbols (metadata queries, no vectors) -------------------------
+
+    def get_repo_map(self, repo: str | None = None, profile: str = "default") -> tuple[list[dict], bool]:
+        """Get structural metadata for map command.
+
+        Returns (rows, truncated). Raises StoreError on query failure.
+        """
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return [], False
+
+        try:
+            table = self._db.open_table(name)
+            select_cols = ["repo", "file", "symbol_name", "chunk_type", "signature",
+                           "start_line", "end_line", "language", "parent_symbol"]
+
+            where = f"repo = '{_escape_sql(repo)}'" if repo else None
+
+            query = table.search().select(select_cols)
+            if where:
+                query = query.where(where)
+            rows = query.limit(50000).to_list()
+            truncated = len(rows) >= 50000
+            if truncated:
+                log.warning("get_repo_map: results truncated at 50,000 rows")
+            return rows, truncated
+        except Exception as e:
+            raise StoreError(f"get_repo_map failed: {e}") from e
+
+    def get_symbols(
+        self,
+        query: str | None = None,
+        repo: str | None = None,
+        kind: str | None = None,
+        limit: int = 100,
+        profile: str = "default",
+    ) -> list[dict]:
+        """Get symbols for symbols command. Filters by name (contains), repo, and chunk_type."""
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return []
+
+        table = self._db.open_table(name)
+        select_cols = ["repo", "file", "symbol_name", "chunk_type", "signature",
+                       "start_line", "end_line", "language", "parent_symbol"]
+
+        conditions = ["symbol_name != ''"]  # exclude preamble/fallback chunks
+        if repo:
+            conditions.append(f"repo = '{_escape_sql(repo)}'")
+        if kind:
+            conditions.append(f"chunk_type = '{_escape_sql(kind)}'")
+
+        # For LIKE, use _escape_sql (quote-safe) and filter in Python for correctness
+        has_query_filter = bool(query)
+        if query:
+            conditions.append(f"symbol_name LIKE '%{_escape_like(query)}%' ESCAPE '\\'")
+
+        where = " AND ".join(conditions)
+
+        try:
+            rows = table.search().select(select_cols).where(where).limit(limit * 3 if has_query_filter else limit).to_list()
+            # Python-side filter ensures exact containment (LIKE _ wildcard won't cause false matches)
+            if has_query_filter:
+                rows = [r for r in rows if query in r.get("symbol_name", "")][:limit]
+            return rows
+        except Exception as e:
+            raise StoreError(f"get_symbols failed: {e}") from e
+
+    # -- table management ----------------------------------------------------
+
+    def compact(self, profile: str = "default"):
+        """Compact the table to reclaim space from deleted rows."""
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return
+        try:
+            table = self._db.open_table(name)
+            table.optimize()
+            log.info("Compacted table %s", name)
+        except Exception as e:
+            log.debug("Compact skipped: %s", e)
+
+    def drop_table(self, profile: str = "default"):
+        """Drop a table entirely."""
+        name = self._table_name(profile)
+        if name in self._list_table_names():
+            self._db.drop_table(name)
+            self._invalidate_table_cache()
+
+    def list_profiles(self) -> list[str]:
+        """List all existing profiles."""
+        profiles = []
+        for name in self._list_table_names():
+            if name == "code_index":
+                profiles.append("default")
+            elif name.startswith("code_index__"):
+                profiles.append(name.removeprefix("code_index__"))
+        return profiles
+
+    # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_result(row: dict) -> SearchResult:
+        # LanceDB _distance: lower = more similar (cosine distance)
+        # Convert to score: higher = better
+        distance = row.get("_distance", 0.0)
+        if distance is None:
+            distance = 0.0
+        score = 1.0 / (1.0 + distance)
+
+        return SearchResult(
+            repo=row.get("repo", ""),
+            file=row.get("file", ""),
+            start_line=row.get("start_line", 0),
+            end_line=row.get("end_line", 0),
+            text=row.get("text", ""),
+            symbol_name=row.get("symbol_name", ""),
+            chunk_type=row.get("chunk_type", ""),
+            signature=row.get("signature", ""),
+            parent_symbol=row.get("parent_symbol", ""),
+            parent_signature=row.get("parent_signature", ""),
+            language=row.get("language", ""),
+            score=score,
         )
-
-
-def search(
-    query_vector: list[float],
-    limit: int = 5,
-    repo_filter: str | None = None,
-) -> list:
-    client = _get_client()
-    query_filter = None
-    if repo_filter:
-        query_filter = Filter(
-            must=[FieldCondition(key="repo", match=MatchValue(value=repo_filter))]
-        )
-
-    response = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=limit,
-        query_filter=query_filter,
-    )
-    return response.points
