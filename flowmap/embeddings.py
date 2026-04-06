@@ -1,121 +1,250 @@
-import random
-import sys
-import time
+"""Embedding backends for FlowMap — Ollama (default) and sentence-transformers (optional)."""
 
-from google import genai
-from google.genai import types
-from google.genai.errors import ClientError
+from __future__ import annotations
 
-from flowmap.config import GOOGLE_API_KEY, EMBEDDING_MODEL, EMBEDDING_DIMS
+import logging
+import threading
+from typing import Protocol
 
-# https://ai.google.dev/gemini-api/docs/embeddings#supported-task-types
-# Index = "documents" (code chunks); ask = NL query optimized for code retrieval
-_TASK_INDEX = "RETRIEVAL_DOCUMENT"
-_TASK_QUERY = "CODE_RETRIEVAL_QUERY"
+import requests
 
-_client = None
+log = logging.getLogger(__name__)
 
-_MAX_RETRIES = 10
-_BASE_DELAY = 2.0
-_MAX_DELAY = 90.0
+# ---------------------------------------------------------------------------
+# Model-specific prefix requirements
+# ---------------------------------------------------------------------------
+
+# Each model has its own prefix format baked into training.
+# Using wrong prefixes silently degrades retrieval quality.
+KNOWN_PREFIXES: dict[str, dict[str, str]] = {
+    # Qwen3-Embedding: uses Instruct/Query format
+    "qwen3-embedding:0.6b": {
+        "document": "",
+        "query": "Instruct: Given a code search query, retrieve relevant code snippets\nQuery: ",
+    },
+    "qwen3-embedding": {
+        "document": "",
+        "query": "Instruct: Given a code search query, retrieve relevant code snippets\nQuery: ",
+    },
+    # Nomic embed text (general purpose, not code-specific)
+    "nomic-embed-text": {
+        "document": "search_document: ",
+        "query": "search_query: ",
+    },
+    # CodeRankEmbed (sentence-transformers)
+    "nomic-ai/CodeRankEmbed": {
+        "document": "",
+        "query": "Represent this query for searching relevant code: ",
+    },
+    # SFR-Embedding-Code (sentence-transformers)
+    "Salesforce/SFR-Embedding-Code-400M_R": {
+        "document": "",
+        "query": "",
+    },
+    # Jina Code v2 (sentence-transformers)
+    "jinaai/jina-embeddings-v2-base-code": {
+        "document": "",
+        "query": "",
+    },
+}
 
 
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        if not GOOGLE_API_KEY:
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
+
+class EmbeddingBackend(Protocol):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+    def embed_query(self, text: str) -> list[float]: ...
+    def dims(self) -> int: ...
+    def model_name(self) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# Ollama backend
+# ---------------------------------------------------------------------------
+
+_ollama_lock = threading.Lock()
+_ollama_checked: dict[str, bool] = {}  # cache: (url, model) → verified
+
+
+class OllamaBackend:
+    """Ollama-based embedding backend via HTTP API."""
+
+    def __init__(self, model: str = "qwen3-embedding:0.6b", url: str = "http://localhost:11434"):
+        self._model = model
+        self._url = url.rstrip("/")
+        self._prefixes = KNOWN_PREFIXES.get(model, {"document": "", "query": ""})
+        self._dims: int | None = None
+        self._session = requests.Session()
+        cache_key = f"{self._url}|{self._model}"
+        with _ollama_lock:
+            if cache_key not in _ollama_checked:
+                self._check_available()
+                _ollama_checked[cache_key] = True
+
+    def _check_available(self):
+        """Verify Ollama is running and model is pulled."""
+        try:
+            resp = self._session.get(f"{self._url}/api/tags", timeout=5)
+            resp.raise_for_status()
+        except requests.ConnectionError:
+            raise ConnectionError(
+                f"Ollama not running at {self._url}. Start it with: ollama serve"
+            )
+        except Exception as e:
+            raise ConnectionError(f"Cannot connect to Ollama at {self._url}: {e}")
+
+        models = [m.get("name", "") for m in resp.json().get("models", [])]
+        # Check exact name or exact base name (before tag) match
+        model_base = self._model.split(":")[0]
+        if not any(
+            m == self._model or m.split(":")[0] == model_base
+            for m in models
+        ):
             raise ValueError(
-                "GOOGLE_API_KEY is not set. Export it: export GOOGLE_API_KEY='your_key'"
+                f"Model '{self._model}' not found in Ollama. Run: ollama pull {self._model}"
             )
-        _client = genai.Client(api_key=GOOGLE_API_KEY)
-    return _client
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        prefix = self._prefixes["document"]
+        prefixed = [f"{prefix}{t}" for t in texts] if prefix else texts
+        return self._embed_batch(prefixed)
+
+    def embed_query(self, text: str) -> list[float]:
+        prefix = self._prefixes["query"]
+        prefixed = f"{prefix}{text}" if prefix else text
+        result = self._embed_batch([prefixed])
+        return result[0]
+
+    def dims(self) -> int:
+        if self._dims is None:
+            # Probe with a small input to detect dimensions
+            result = self._embed_batch(["test"])
+            self._dims = len(result[0])
+        return self._dims
+
+    def close(self):
+        """Close the HTTP session."""
+        self._session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def model_name(self) -> str:
+        return f"ollama:{self._model}"
+
+    def _embed_batch(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
+        """Embed texts in batches via Ollama /api/embed endpoint."""
+        all_embeddings: list[list[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            last_err = None
+            for attempt in range(3):
+                try:
+                    resp = self._session.post(
+                        f"{self._url}/api/embed",
+                        json={"model": self._model, "input": batch},
+                        timeout=120,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    last_err = None
+                    break
+                except (requests.ConnectionError, requests.HTTPError) as e:
+                    last_err = e
+                    if attempt < 2:
+                        import time
+                        time.sleep(2 ** attempt)  # 1s, 2s backoff
+                        continue
+                except requests.Timeout:
+                    raise TimeoutError(
+                        f"Ollama embedding timed out after 120s (batch size: {len(batch)}). "
+                        "Try reducing batch size or check Ollama resource usage."
+                    )
+            if last_err is not None:
+                raise ConnectionError(
+                    f"Ollama connection lost after 3 retries. Is it still running at {self._url}?"
+                )
+
+            embeddings = data.get("embeddings", [])
+            if len(embeddings) != len(batch):
+                raise ValueError(
+                    f"Ollama returned {len(embeddings)} embeddings for {len(batch)} inputs"
+                )
+
+            # Cache detected dimensions
+            if self._dims is None and embeddings:
+                self._dims = len(embeddings[0])
+
+            all_embeddings.extend(embeddings)
+
+        return all_embeddings
 
 
-def _is_rate_limited(err: ClientError) -> bool:
-    code = getattr(err, "code", None)
-    if code == 429:
-        return True
-    msg = str(err).lower()
-    return "429" in msg or "resource_exhausted" in msg
+# ---------------------------------------------------------------------------
+# Sentence-transformers backend
+# ---------------------------------------------------------------------------
 
+class SentenceTransformerBackend:
+    """Optional backend. Requires: pip install flowmap[local-embeddings]"""
 
-def _embed_config(task_type: str) -> types.EmbedContentConfig:
-    return types.EmbedContentConfig(
-        output_dimensionality=EMBEDDING_DIMS,
-        task_type=task_type,
-    )
-
-
-def _embed_batch_once(texts: list[str]) -> list[list[float]]:
-    client = _get_client()
-    response = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=texts,
-        config=_embed_config(_TASK_INDEX),
-    )
-    return [e.values for e in response.embeddings]
-
-
-def get_embeddings_batch(texts: list[str]) -> tuple[list[list[float]], bool]:
-    """Returns (embeddings, had_any_429). Retries on 429 and splits batch if needed."""
-    if not texts:
-        return [], False
-    return _embed_batch_with_retry(texts)
-
-
-def _embed_batch_with_retry(texts: list[str]) -> tuple[list[list[float]], bool]:
-    last_err: Exception | None = None
-    saw_429 = False
-    for attempt in range(_MAX_RETRIES):
+    def __init__(self, model: str = "nomic-ai/CodeRankEmbed"):
         try:
-            return _embed_batch_once(texts), saw_429
-        except ClientError as e:
-            last_err = e
-            if not _is_rate_limited(e):
-                raise
-            saw_429 = True
-            delay = min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
-            delay += random.uniform(0, 0.75)
-            print(
-                f"flowmap: Gemini rate limit (429); sleeping {delay:.1f}s "
-                f"(retry {attempt + 1}/{_MAX_RETRIES}, batch size {len(texts)})...",
-                file=sys.stderr,
-                flush=True,
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers not installed. "
+                "Run: pip install flowmap[local-embeddings]"
             )
-            time.sleep(delay)
-    if last_err is not None:
-        if len(texts) > 1:
-            print(
-                "flowmap: splitting embedding batch in half after repeated 429s...",
-                file=sys.stderr,
-                flush=True,
-            )
-            mid = len(texts) // 2
-            left, l429 = _embed_batch_with_retry(texts[:mid])
-            right, r429 = _embed_batch_with_retry(texts[mid:])
-            return left + right, saw_429 or l429 or r429
-        raise last_err
-    raise RuntimeError("embedding batch failed")
+        self._lock = threading.Lock()
+        self._model_name = model
+        self._prefixes = KNOWN_PREFIXES.get(model, {"document": "", "query": ""})
+        log.info("Loading model: %s (first run downloads weights)", model)
+        with self._lock:
+            self._model = SentenceTransformer(model, trust_remote_code=True)
+        self._dims_val = self._model.get_sentence_embedding_dimension()
+        if self._dims_val is None:
+            # Fallback: probe with a test input for models that don't report dims
+            probe = self._model.encode(["test"])
+            self._dims_val = len(probe[0])
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        prefix = self._prefixes["document"]
+        prefixed = [f"{prefix}{t}" for t in texts] if prefix else texts
+        with self._lock:
+            return self._model.encode(prefixed, batch_size=32, show_progress_bar=False).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        prefix = self._prefixes["query"]
+        prefixed = f"{prefix}{text}" if prefix else text
+        with self._lock:
+            return self._model.encode([prefixed])[0].tolist()
+
+    def dims(self) -> int:
+        return self._dims_val
+
+    def model_name(self) -> str:
+        return f"st:{self._model_name}"
 
 
-def get_embedding(text: str) -> list[float]:
-    last_err: Exception | None = None
-    for attempt in range(_MAX_RETRIES):
-        try:
-            client = _get_client()
-            response = client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=text,
-                config=_embed_config(_TASK_QUERY),
-            )
-            return response.embeddings[0].values
-        except ClientError as e:
-            last_err = e
-            if not _is_rate_limited(e):
-                raise
-            delay = min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
-            delay += random.uniform(0, 0.75)
-            time.sleep(delay)
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError("embedding failed")
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def create_backend(backend: str, model: str, ollama_url: str = "http://localhost:11434") -> EmbeddingBackend:
+    """Create an embedding backend from config values."""
+    if backend == "ollama":
+        return OllamaBackend(model=model, url=ollama_url)
+    elif backend == "sentence-transformers":
+        return SentenceTransformerBackend(model=model)
+    else:
+        raise ValueError(f"Unknown embedding backend: {backend}. Use 'ollama' or 'sentence-transformers'.")
