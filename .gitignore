@@ -18,6 +18,7 @@ __pycache__/
 *.egg
 dist/
 build/
+docs/
 
 # Tests & coverage
 .pytest_cache/
