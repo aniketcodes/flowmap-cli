@@ -101,6 +101,29 @@ class TestRenderKeyword:
         out = render_keyword_results(results)
         assert "hello world" in out
 
+    def test_json(self):
+        results = [_MockRgResult()]
+        out = render_keyword_results(results, "hello", "json")
+        data = json.loads(out)
+        assert data["query"] == "hello"
+        assert data["mode"] == "keyword"
+        assert len(data["results"]) == 1
+        assert data["results"][0]["file"] == "a.py"
+        assert data["results"][0]["text"] == "hello world"
+
+    def test_json_empty(self):
+        out = render_keyword_results([], "hello", "json")
+        data = json.loads(out)
+        assert data["query"] == "hello"
+        assert data["mode"] == "keyword"
+        assert data["results"] == []
+
+    def test_default_params_backward_compat(self):
+        """Existing call sites without query/fmt still work."""
+        results = [_MockRgResult()]
+        out = render_keyword_results(results)
+        assert "a.py" in out
+
 
 class TestRenderMap:
     def test_json(self):

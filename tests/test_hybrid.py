@@ -224,3 +224,28 @@ def test_limit_respected(mock_rg):
     )
 
     assert len(results) <= 5
+
+
+# ---------------------------------------------------------------------------
+# Regex passthrough
+# ---------------------------------------------------------------------------
+
+@patch("flowmap.search.hybrid.rg_search")
+def test_hybrid_passes_regex_to_rg(mock_rg):
+    """When regex=True, hybrid_search should pass it through to rg_search."""
+    mock_rg.return_value = []
+    backend = _make_mock_backend()
+    store = _make_mock_store()
+
+    hybrid_search(
+        query="test.*pattern",
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        regex=True,
+    )
+
+    # Verify regex was passed to rg_search as keyword arg
+    _, kwargs = mock_rg.call_args
+    assert kwargs.get("regex") is True

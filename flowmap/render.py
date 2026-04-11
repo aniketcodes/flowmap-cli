@@ -116,8 +116,19 @@ def render_symbol_results(results, query: str, fmt: str) -> str:
     return "\n".join(lines)
 
 
-def render_keyword_results(results) -> str:
+def render_keyword_results(results, query: str = "", fmt: str = "text") -> str:
     """Format keyword (ripgrep) search results."""
+    if fmt == "json":
+        output = {
+            "query": query,
+            "mode": "keyword",
+            "results": [
+                {"repo": r.repo, "file": r.file, "line": r.line, "text": r.text}
+                for r in results
+            ],
+        }
+        return json.dumps(output, indent=2)
+
     lines = []
     for i, r in enumerate(results, 1):
         lines.append(f"[{i}] {r.repo}/{r.file}:{r.line}  {r.text[:120]}{'...' if len(r.text) > 120 else ''}")

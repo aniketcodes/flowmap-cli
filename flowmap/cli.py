@@ -357,8 +357,9 @@ def index(ctx, repo, full, dry_run):
 @click.option("--mode", type=click.Choice(["hybrid", "semantic", "keyword", "symbol"]), default="hybrid")
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--rerank", is_flag=True, default=False, help="Enable cross-encoder reranking (slower, higher quality)")
+@click.option("--regex", "use_regex", is_flag=True, default=False, help="Treat keyword query as regex (default: literal match)")
 @click.pass_context
-def search(ctx, query, repo, limit, mode, fmt, rerank):
+def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
     """Search across indexed repositories."""
     cfg = _load_cfg(ctx)
 
@@ -388,7 +389,25 @@ def search(ctx, query, repo, limit, mode, fmt, rerank):
                 click.echo(f"Error: {e}", err=True)
                 sys.exit(1)
 
-    # Get vector dims: from backend if available, else from stored metadata
+    # --- Keyword only (ripgrep) — no vector store needed ---
+    if mode == "keyword":
+        from flowmap.search.ripgrep import rg_search
+
+        repo_paths = cfg.repo_paths()
+        if repo:
+            repo_paths = {k: v for k, v in repo_paths.items() if k == repo}
+
+        results = rg_search(query, repo_paths, limit=limit, regex=use_regex)
+        if not results:
+            if fmt == "json":
+                click.echo(render_keyword_results([], query, fmt))
+            else:
+                click.echo("No results found.")
+            return
+        click.echo(render_keyword_results(results, query, fmt))
+        return
+
+    # Modes that need the vector store
     if backend:
         store_dims = backend.dims()
     else:
@@ -413,10 +432,14 @@ def search(ctx, query, repo, limit, mode, fmt, rerank):
                 repo_filter=repo,
                 reranking_enabled=rerank or cfg.reranking.enabled,
                 reranking_model=cfg.reranking.model,
+                regex=use_regex,
             )
 
             if not results:
-                click.echo("No results found.")
+                if fmt == "json":
+                    click.echo(render_hybrid_results([], query, fmt))
+                else:
+                    click.echo("No results found.")
                 return
             click.echo(render_hybrid_results(results, query, fmt))
 
@@ -426,7 +449,10 @@ def search(ctx, query, repo, limit, mode, fmt, rerank):
             results = store.search_vector(query_vector, limit=limit, repo_filter=repo)
 
             if not results:
-                click.echo("No results found.")
+                if fmt == "json":
+                    click.echo(render_semantic_results([], query, fmt))
+                else:
+                    click.echo("No results found.")
                 return
             click.echo(render_semantic_results(results, query, fmt))
 
@@ -434,23 +460,13 @@ def search(ctx, query, repo, limit, mode, fmt, rerank):
         elif mode == "symbol":
             results = store.search_symbol(query, repo_filter=repo, limit=limit)
             if not results:
-                click.echo("No symbols found.")
+                if fmt == "json":
+                    click.echo(render_symbol_results([], query, fmt))
+                else:
+                    click.echo("No symbols found.")
                 return
             click.echo(render_symbol_results(results, query, fmt))
 
-        # --- Keyword only (ripgrep) ---
-        elif mode == "keyword":
-            from flowmap.search.ripgrep import rg_search
-
-            repo_paths = cfg.repo_paths()
-            if repo:
-                repo_paths = {k: v for k, v in repo_paths.items() if k == repo}
-
-            results = rg_search(query, repo_paths, limit=limit)
-            if not results:
-                click.echo("No results found.")
-                return
-            click.echo(render_keyword_results(results))
     except StoreError as e:
         click.echo(f"Error: {e}", err=True)
         click.echo("Try: flowmap index --full", err=True)
@@ -479,7 +495,9 @@ def repo_map(ctx, repo, fmt):
             rows, truncated = store.get_repo_map(repo=repo)
 
             if not rows:
-                if repo:
+                if fmt == "json":
+                    click.echo(render_map([], fmt))
+                elif repo:
                     click.echo(f"No indexed data for repo '{repo}'. Run: flowmap index --repo {repo}")
                 else:
                     click.echo("No indexed data. Run: flowmap index")
@@ -519,7 +537,10 @@ def symbols(ctx, query, repo, kind, limit, fmt):
             rows = store.get_symbols(query=query, repo=repo, kind=kind, limit=limit)
 
             if not rows:
-                click.echo("No symbols found.")
+                if fmt == "json":
+                    click.echo(render_symbols([], query, fmt))
+                else:
+                    click.echo("No symbols found.")
                 return
 
             click.echo(render_symbols(rows, query, fmt))
@@ -680,6 +701,19 @@ def history(ctx, query, since, repo, limit, symbol, fmt):
     from flowmap.render import render_timeline
     from flowmap.store import StoreError, VectorStore
 
+    # Create embedding backend for vector fallback (build_timeline uses it only if symbol search fails)
+    from flowmap.embeddings import create_backend
+
+    backend = None
+    try:
+        backend = create_backend(
+            backend=cfg.embedding.backend,
+            model=cfg.embedding.model,
+            ollama_url=cfg.embedding.ollama_url,
+        )
+    except (ConnectionError, ValueError, ImportError) as e:
+        click.echo(f"Note: embedding unavailable ({e}), history limited to symbol matches.", err=True)
+
     try:
         with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
             timeline = build_timeline(
@@ -690,6 +724,7 @@ def history(ctx, query, since, repo, limit, symbol, fmt):
                 limit=limit,
                 repo_filter=repo,
                 symbol_filter=symbol,
+                embedding_backend=backend,
             )
     except StoreError as e:
         click.echo(f"Error: {e}", err=True)
@@ -697,9 +732,12 @@ def history(ctx, query, since, repo, limit, symbol, fmt):
         sys.exit(1)
 
     if not timeline.entries:
-        click.echo(f"No history found for '{query}'.")
-        if not timeline.scoped_files:
-            click.echo("  No matching files in the index. Try a different query or run: flowmap index")
+        if fmt == "json":
+            click.echo(render_timeline(timeline, fmt))
+        else:
+            click.echo(f"No history found for '{query}'.")
+            if not timeline.scoped_files:
+                click.echo("  No matching files in the index. Try a different query or run: flowmap index")
         return
 
     click.echo(render_timeline(timeline, fmt))

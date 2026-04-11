@@ -62,6 +62,7 @@ def rg_search(
     repo_paths: dict[str, str],
     limit: int = 50,
     timeout: float = 10.0,
+    regex: bool = False,
 ) -> list[RgResult]:
     """Run ripgrep across all repos. Returns live filesystem results.
 
@@ -81,7 +82,7 @@ def rg_search(
     cmd = [
         "rg",
         "--json",
-        "--fixed-strings",           # literal string match, not regex
+        *(["--fixed-strings"] if not regex else []),
         "--max-columns", "500",      # truncate very long lines
         "--no-heading",
         "--no-binary",               # skip binary files
@@ -109,6 +110,7 @@ def rg_search(
         log.warning("ripgrep error: %s", result.stderr[:200] if result.stderr else "unknown")
         return []
     if result.returncode == 1:
+        log.debug("ripgrep: no matches for query '%s'", query)
         return []
 
     return _parse_json_output(result.stdout, repo_paths, limit)

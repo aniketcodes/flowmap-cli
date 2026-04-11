@@ -7,7 +7,7 @@ import pytest
 
 from flowmap.history.timeline import Timeline, build_timeline
 from flowmap.services.indexing import IndexResult, run_index
-from flowmap.store import SearchResult
+from flowmap.store import SearchResult, StoreError
 from tests.conftest import FakeCommit, FakeHistory
 
 
@@ -140,6 +140,84 @@ class TestBuildTimeline:
         assert len(tl.entries) >= 1
         # The entry should have no structural changes (timed out)
         assert tl.entries[0].changes == []
+
+
+    # --- Vector fallback tests ---
+
+    def test_vector_fallback_when_symbol_empty(self):
+        """When symbol search returns nothing, vector search should be used as fallback."""
+        store = MagicMock()
+        store.search_symbol.return_value = []
+        store.search_vector.return_value = [
+            _make_search_result("repo1", "routes.ts", "calculateRoute"),
+        ]
+
+        backend = MagicMock()
+        backend.embed_query.return_value = [0.1] * 32
+
+        with patch("flowmap.history.timeline.get_file_history") as mock_hist, \
+             patch("flowmap.history.timeline.pickaxe_search") as mock_pick:
+            mock_hist.return_value = None
+            mock_pick.return_value = []
+            tl = build_timeline("calculateRoute", {"repo1": "/tmp/repo1"}, store,
+                               embedding_backend=backend)
+
+        assert "repo1/routes.ts" in tl.scoped_files
+        store.search_vector.assert_called_once()
+
+    def test_no_vector_fallback_when_symbol_works(self):
+        """Vector search should NOT be called when symbol search succeeds."""
+        store = MagicMock()
+        store.search_symbol.return_value = [
+            _make_search_result("repo1", "a.py", "foo"),
+        ]
+
+        backend = MagicMock()
+
+        with patch("flowmap.history.timeline.get_file_history") as mock_hist, \
+             patch("flowmap.history.timeline.pickaxe_search") as mock_pick:
+            mock_hist.return_value = None
+            mock_pick.return_value = []
+            tl = build_timeline("foo", {"repo1": "/tmp/repo1"}, store,
+                               embedding_backend=backend)
+
+        store.search_vector.assert_not_called()
+
+    def test_vector_fallback_embedding_failure(self):
+        """If embedding fails during vector fallback, should degrade gracefully."""
+        store = MagicMock()
+        store.search_symbol.return_value = []
+
+        backend = MagicMock()
+        backend.embed_query.side_effect = ConnectionError("Ollama down")
+
+        tl = build_timeline("query", {"repo1": "/tmp/repo1"}, store,
+                           embedding_backend=backend)
+        assert tl.scoped_files == []
+        assert tl.entries == []
+
+    def test_vector_fallback_store_error(self):
+        """If vector store raises StoreError, should degrade gracefully."""
+        store = MagicMock()
+        store.search_symbol.return_value = []
+        store.search_vector.side_effect = StoreError("dimension mismatch")
+
+        backend = MagicMock()
+        backend.embed_query.return_value = [0.1] * 32
+
+        tl = build_timeline("query", {"repo1": "/tmp/repo1"}, store,
+                           embedding_backend=backend)
+        assert tl.scoped_files == []
+        assert tl.entries == []
+
+    def test_no_vector_fallback_without_backend(self):
+        """Without embedding_backend, no vector fallback should be attempted."""
+        store = MagicMock()
+        store.search_symbol.return_value = []
+
+        tl = build_timeline("query", {"repo1": "/tmp/repo1"}, store)
+        store.search_vector.assert_not_called()
+        assert tl.scoped_files == []
 
 
 class TestRunIndex:

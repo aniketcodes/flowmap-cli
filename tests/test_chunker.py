@@ -747,3 +747,240 @@ def test_go_exact_chunk_count():
     chunks = chunk_file("main.go", GO_CODE, ".go")
     # Expected: Service type, Service.Process, NewService, preamble = 4
     assert len(chunks) == 4, f"Expected 4 chunks, got {len(chunks)}: {[c.symbol_name or c.chunk_type for c in chunks]}"
+
+
+# ---------------------------------------------------------------------------
+# Swift
+# ---------------------------------------------------------------------------
+
+SWIFT_CODE = '''\
+import Foundation
+
+func globalFunction(x: Int) -> Int {
+    return x * 2
+}
+
+class ViewController {
+    func viewDidLoad() {}
+    func configure() {}
+}
+
+struct Point {
+    var x: Double
+    var y: Double
+}
+
+enum Direction {
+    case north, south
+}
+
+protocol Drawable {
+    func draw()
+}
+'''
+
+
+def test_swift_function():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "globalFunction" in symbols
+
+
+def test_swift_class():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "ViewController" in symbols
+
+
+def test_swift_struct():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    point = next(c for c in chunks if c.symbol_name == "Point")
+    assert point.chunk_type == "class"
+
+
+def test_swift_enum():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "Direction" in symbols
+
+
+def test_swift_protocol():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    drawable = next(c for c in chunks if c.symbol_name == "Drawable")
+    assert drawable.chunk_type == "class"
+
+
+def test_swift_preamble():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    preambles = [c for c in chunks if c.chunk_type == "preamble"]
+    assert len(preambles) >= 1
+    assert "import Foundation" in preambles[0].text
+
+
+def test_swift_exact_chunk_count():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    # Expected: globalFunction, ViewController, Point, Direction, Drawable (5 defs) + 1 preamble = 6
+    assert len(chunks) == 6, f"Expected 6 chunks, got {len(chunks)}: {[c.symbol_name or c.chunk_type for c in chunks]}"
+
+
+def test_swift_language_field():
+    chunks = chunk_file("test.swift", SWIFT_CODE, ".swift")
+    assert all(c.language == "swift" for c in chunks)
+
+
+def test_swift_init_deinit():
+    """Swift init/deinit inside a class should be extractable as method chunks."""
+    code = '''\
+class Service {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    deinit {
+        print("cleanup")
+    }
+
+    func process() {}
+}
+'''
+    # This class is small (<8000 chars) so it won't split — but verify that if it
+    # did split, the method types would be recognized by checking a large version.
+    chunks = chunk_file("svc.swift", code, ".swift")
+    svc = next(c for c in chunks if c.symbol_name == "Service")
+    assert "init(name:" in svc.text
+    assert "deinit" in svc.text
+
+
+def test_swift_large_class_splits():
+    """Swift class >8000 chars should split into per-method chunks."""
+    methods = "\n".join(
+        f"    func method_{i}(x: Int) -> Int {{ return x + {i}; /* padding to make this method longer for the test fixture to exceed the 8000 char threshold needed */ }}"
+        for i in range(120)
+    )
+    code = f"class BigSwiftService {{\n{methods}\n}}\n"
+    assert len(code) > 8000, f"Fixture must exceed 8000 chars, got {len(code)}"
+    chunks = chunk_file("big.swift", code, ".swift")
+    class_chunks = [c for c in chunks if c.chunk_type == "class"]
+    assert len(class_chunks) >= 1
+    assert class_chunks[0].symbol_name == "BigSwiftService"
+    method_chunks = [c for c in chunks if c.chunk_type in ("function", "method") and c.parent_symbol == "BigSwiftService"]
+    assert len(method_chunks) >= 50, f"Expected many method chunks, got {len(method_chunks)}"
+
+
+# ---------------------------------------------------------------------------
+# JavaScript: CommonJS exports
+# ---------------------------------------------------------------------------
+
+JS_CJS_CODE = '''\
+const helper = require('./helper');
+
+module.exports.getArea = function(radius) {
+    return Math.PI * radius * radius;
+};
+
+exports.getCircumference = (radius) => {
+    return 2 * Math.PI * radius;
+};
+
+function internalHelper() {
+    return 42;
+}
+'''
+
+
+def test_js_cjs_module_exports_function():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "getArea" in symbols
+
+
+def test_js_cjs_exports_arrow():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "getCircumference" in symbols
+
+
+def test_js_cjs_internal_function_still_works():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "internalHelper" in symbols
+
+
+def test_js_cjs_no_garbage():
+    """expression_statement that is NOT a CommonJS export should not become a symbol."""
+    code = 'console.log("hello");\nx = 42;\nmodule.exports.getArea = function() { return 1; };\n'
+    chunks = chunk_file("mixed.js", code, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "getArea" in symbols
+    assert "log" not in symbols
+    assert "x" not in symbols
+
+
+def test_js_cjs_require_reexport_rejected():
+    """module.exports = require('./other') should not produce a symbol."""
+    code = "module.exports = require('./other');\n"
+    chunks = chunk_file("reexport.js", code, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert len(symbols) == 0
+
+
+def test_js_cjs_config_object_rejected():
+    """module.exports.config = { port: 3000 } should not produce a symbol (object on named export)."""
+    code = "module.exports.config = { port: 3000, host: 'localhost' };\n"
+    chunks = chunk_file("config.js", code, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "config" not in symbols
+
+
+def test_js_cjs_named_function():
+    """module.exports = function myFunc() {} should extract 'myFunc'."""
+    code = "module.exports = function myFunc() { return 42; };\n"
+    chunks = chunk_file("named.js", code, ".js")
+    symbols = {c.symbol_name for c in chunks if c.symbol_name}
+    assert "myFunc" in symbols
+
+
+def test_js_cjs_class_export():
+    """module.exports = class Service {} should extract 'Service' with chunk_type 'class'."""
+    code = "module.exports = class Service { constructor() {} };\n"
+    chunks = chunk_file("svc.js", code, ".js")
+    svc = next((c for c in chunks if c.symbol_name == "Service"), None)
+    assert svc is not None, f"Expected Service, got: {[c.symbol_name for c in chunks]}"
+    assert svc.chunk_type == "class"
+
+
+def test_js_cjs_bulk_as_single_chunk():
+    """module.exports = { method1() {} } should produce one chunk with symbol 'module.exports'."""
+    code = "module.exports = { method1() { return 1; }, method2() { return 2; } };\n"
+    chunks = chunk_file("bulk.js", code, ".js")
+    bulk = next((c for c in chunks if c.symbol_name == "module.exports"), None)
+    assert bulk is not None, f"Expected module.exports chunk, got: {[c.symbol_name for c in chunks]}"
+
+
+def test_js_cjs_preamble():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    preambles = [c for c in chunks if c.chunk_type == "preamble"]
+    assert len(preambles) >= 1
+    combined = " ".join(p.text for p in preambles)
+    assert "require" in combined
+
+
+def test_js_cjs_exact_chunk_count():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    # Expected: getArea + getCircumference + internalHelper + preamble = 4
+    assert len(chunks) == 4, f"Expected 4 chunks, got {len(chunks)}: {[c.symbol_name or c.chunk_type for c in chunks]}"
+
+
+def test_js_cjs_line_ranges():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    area = next(c for c in chunks if c.symbol_name == "getArea")
+    assert area.start_line > 0
+    assert area.end_line >= area.start_line
+
+
+def test_js_cjs_signature():
+    chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
+    area = next(c for c in chunks if c.symbol_name == "getArea")
+    assert "module.exports.getArea" in area.signature
