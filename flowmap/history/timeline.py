@@ -36,13 +36,8 @@ class Timeline:
     scoped_symbols: list[str] = field(default_factory=list)
 
 
-def _scope_from_symbol_search(
-    query: str,
-    store: VectorStore,
-    repo_filter: str | None = None,
-) -> list[tuple[str, str, str]]:
-    """Use symbol search to find relevant (repo, file, symbol) tuples."""
-    results = store.search_symbol(query, repo_filter=repo_filter, limit=10)
+def _dedupe_results_to_scope(results) -> list[tuple[str, str, str]]:
+    """Deduplicate search results to unique (repo, file, symbol) tuples."""
     seen: set[tuple[str, str]] = set()
     scoped: list[tuple[str, str, str]] = []
     for r in results:
@@ -53,6 +48,32 @@ def _scope_from_symbol_search(
             if len(scoped) >= MAX_SCOPED_FILES:
                 break
     return scoped
+
+
+def _scope_from_symbol_search(
+    query: str,
+    store: VectorStore,
+    repo_filter: str | None = None,
+) -> list[tuple[str, str, str]]:
+    """Use symbol search to find relevant (repo, file, symbol) tuples."""
+    results = store.search_symbol(query, repo_filter=repo_filter, limit=10)
+    return _dedupe_results_to_scope(results)
+
+
+def _scope_from_vector_search(
+    query: str,
+    store: VectorStore,
+    embedding_backend,
+    repo_filter: str | None = None,
+) -> list[tuple[str, str, str]]:
+    """Fallback: use vector search to find relevant (repo, file, symbol) tuples."""
+    try:
+        query_vector = embedding_backend.embed_query(query)
+        results = store.search_vector(query_vector, limit=10, repo_filter=repo_filter)
+    except Exception as e:
+        log.debug("Vector fallback failed during history scope: %s", e)
+        return []
+    return _dedupe_results_to_scope(results)
 
 
 def _diff_commit(
@@ -86,6 +107,7 @@ def build_timeline(
     limit: int = 20,
     repo_filter: str | None = None,
     symbol_filter: str | None = None,
+    embedding_backend=None,
 ) -> Timeline:
     """Build a timeline of structural changes for a query.
 
@@ -100,6 +122,10 @@ def build_timeline(
     # --- Step 1: Scope resolution ---
     search_term = symbol_filter or query
     scoped = _scope_from_symbol_search(search_term, store, repo_filter)
+
+    if not scoped and embedding_backend is not None:
+        log.debug("Symbol search found nothing for '%s', falling back to vector search", search_term)
+        scoped = _scope_from_vector_search(search_term, store, embedding_backend, repo_filter)
 
     if not scoped:
         return timeline

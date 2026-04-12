@@ -100,7 +100,8 @@ class TestMap:
     def test_map_json_empty(self, runner, config_dir):
         result = runner.invoke(main, ["--config", str(config_dir), "map", "--format", "json"])
         assert result.exit_code == 0
-        assert "No indexed data" in result.output
+        data = json.loads(result.output)
+        assert data["repos"] == []
 
 
 class TestSymbols:
@@ -170,6 +171,49 @@ class TestSearchCommand:
         assert result.exit_code == 0
         assert "No symbols found" in result.output
 
+    def test_search_symbol_json_empty(self, runner, config_dir):
+        """Symbol search with --format json emits valid JSON on empty results."""
+        result = runner.invoke(main, [
+            "--config", str(config_dir), "search", "myFunc", "--mode", "symbol", "--format", "json",
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["query"] == "myFunc"
+        assert data["mode"] == "symbol"
+        assert data["results"] == []
+
+    def test_search_keyword_json_empty(self, runner, config_dir):
+        """Keyword search with --format json emits valid JSON on empty results."""
+        result = runner.invoke(main, [
+            "--config", str(config_dir), "search", "xyznonexistent999", "--mode", "keyword", "--format", "json",
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["query"] == "xyznonexistent999"
+        assert data["mode"] == "keyword"
+        assert data["results"] == []
+
+    def test_search_keyword_regex_flag(self, runner, config_dir, tmp_path):
+        """--regex flag is accepted and propagates to ripgrep (no --fixed-strings)."""
+        repo_dir = tmp_path / "my-repo"
+        (repo_dir / "test.py").write_text("def hello_world():\n    print('hello world')\n")
+        result = runner.invoke(main, [
+            "--config", str(config_dir), "search", "hello.*world", "--mode", "keyword", "--regex",
+        ])
+        assert result.exit_code == 0
+
+    def test_search_hybrid_json_empty(self, runner, config_dir):
+        """Hybrid search with --format json emits valid JSON even when backend unavailable."""
+        result = runner.invoke(main, [
+            "--config", str(config_dir), "search", "xyznonexistent999", "--format", "json",
+        ])
+        assert result.exit_code == 0
+        # When embedding unavailable, hybrid falls back to keyword mode — still valid JSON
+        assert "{" in result.output, f"No JSON found in output: {result.output!r}"
+        json_start = result.output.index("{")
+        data = json.loads(result.output[json_start:])
+        assert data["results"] == []
+
 
 class TestIndexCommand:
     def test_index_dry_run_fast(self, runner, config_dir):
@@ -210,8 +254,14 @@ class TestHistoryCommand:
             "--config", str(config_dir), "history", "someQuery", "--format", "json",
         ])
         assert result.exit_code == 0
-        # Even with empty results, should not crash
-        assert "No history found" in result.output
+        # Extract JSON from output (stderr warnings may be mixed in by CliRunner)
+        assert "{" in result.output, f"No JSON found in output: {result.output!r}"
+        json_start = result.output.index("{")
+        data = json.loads(result.output[json_start:])
+        assert data["query"] == "someQuery"
+        assert data["entries"] == []
+        assert "scoped_files" in data
+        assert "scoped_symbols" in data
 
 
 class TestMalformedConfig:

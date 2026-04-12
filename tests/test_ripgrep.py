@@ -1,7 +1,9 @@
 """Tests for ripgrep wrapper — JSON output parsing, error handling."""
 
 import json
-from flowmap.search.ripgrep import _parse_json_output, is_available
+from unittest.mock import MagicMock, patch
+
+from flowmap.search.ripgrep import _parse_json_output, is_available, rg_search
 
 
 # ---------------------------------------------------------------------------
@@ -113,3 +115,39 @@ def test_is_available_returns_bool():
     """is_available should return a boolean, not raise."""
     result = is_available()
     assert isinstance(result, bool)
+
+
+# ---------------------------------------------------------------------------
+# Regex flag
+# ---------------------------------------------------------------------------
+
+def test_default_uses_fixed_strings():
+    """By default, --fixed-strings should be in the rg command and not break other flags."""
+    with patch("flowmap.search.ripgrep.subprocess.run") as mock_run, \
+         patch("flowmap.search.ripgrep.is_available", return_value=True):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        rg_search("test.pattern", {"repo": "/tmp/repo"})
+        cmd = mock_run.call_args[0][0]
+        assert "--fixed-strings" in cmd
+        # Verify --fixed-strings doesn't split --max-columns from its value
+        mc_idx = cmd.index("--max-columns")
+        assert cmd[mc_idx + 1] == "500", f"--max-columns value displaced: {cmd}"
+
+
+def test_regex_flag_omits_fixed_strings():
+    """When regex=True, --fixed-strings should not be in the rg command."""
+    with patch("flowmap.search.ripgrep.subprocess.run") as mock_run, \
+         patch("flowmap.search.ripgrep.is_available", return_value=True):
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+        rg_search("test.*pattern", {"repo": "/tmp/repo"}, regex=True)
+        cmd = mock_run.call_args[0][0]
+        assert "--fixed-strings" not in cmd
+
+
+def test_invalid_regex_returns_empty():
+    """Invalid regex patterns cause rg exit code 2 — should return empty list."""
+    with patch("flowmap.search.ripgrep.subprocess.run") as mock_run, \
+         patch("flowmap.search.ripgrep.is_available", return_value=True):
+        mock_run.return_value = MagicMock(returncode=2, stdout="", stderr="regex parse error")
+        results = rg_search("foo[bar", {"repo": "/tmp/repo"}, regex=True)
+        assert results == []

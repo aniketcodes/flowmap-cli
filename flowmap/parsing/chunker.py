@@ -71,6 +71,11 @@ _CODE_NODE_TYPES: dict[str, set[str]] = {
         "enum_declaration",
         "record_declaration",
     },
+    "swift": {
+        "function_declaration",
+        "class_declaration",      # covers class, struct, enum, extension
+        "protocol_declaration",
+    },
 }
 
 # Node types that contain methods/properties (for large class splitting)
@@ -85,6 +90,7 @@ _METHOD_NODE_TYPES: dict[str, set[str]] = {
     "javascript": {"method_definition"},
     "go": set(),  # Go methods are top-level, not inside structs
     "java": {"method_declaration", "constructor_declaration", "field_declaration"},
+    "swift": {"function_declaration", "init_declaration", "deinit_declaration", "subscript_declaration", "protocol_function_declaration"},
 }
 
 # Node types that are "decorated" wrappers (extract inner definition, not both)
@@ -136,6 +142,18 @@ def _chunk_code(content: str, language: str, parser) -> list[Chunk]:
 
     for child in root.children:
         node_type = child.type
+
+        # CommonJS exports (JS/TS only) — handled before code_types gate
+        if node_type == "expression_statement" and language in ("javascript", "typescript"):
+            cjs = _find_commonjs_export(child, content_bytes)
+            if cjs is not None:
+                value_node, cjs_name = cjs
+                chunk = _node_to_chunk(child, content_bytes, language, inner_def=value_node)
+                if chunk:
+                    chunk.symbol_name = cjs_name
+                    chunks.append(chunk)
+                    extracted_ranges.append((child.start_byte, child.end_byte))
+            continue  # expression_statements: CJS ones extracted above, rest stay in preamble
 
         if node_type not in code_types:
             continue
@@ -243,6 +261,14 @@ def _extract_symbol_info(node: Node, content_bytes: bytes, language: str) -> tup
         "field_definition": "property",
         "property_signature": "property",
         "field_declaration": "property",
+        "protocol_declaration": "class",
+        "init_declaration": "method",
+        "deinit_declaration": "method",
+        "subscript_declaration": "method",
+        "protocol_function_declaration": "method",
+        "class": "class",                # JS: module.exports = class Service {}
+        "function_expression": "function",
+        "generator_function": "function",
     }
     chunk_type = type_map.get(node_type, "function")
 
@@ -251,6 +277,10 @@ def _extract_symbol_info(node: Node, content_bytes: bytes, language: str) -> tup
     name_node = node.child_by_field_name("name")
     if name_node:
         symbol_name = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
+
+    # Swift deinit has no name field
+    if not symbol_name and node_type == "deinit_declaration":
+        symbol_name = "deinit"
 
     # Go method receiver: extract type name for qualified symbol
     if language == "go" and node_type == "method_declaration":
@@ -291,7 +321,7 @@ def _extract_parent_context(node: Node, content_bytes: bytes) -> tuple[str, str]
     while parent:
         if parent.type in (
             "class_definition", "class_declaration",
-            "interface_declaration",
+            "interface_declaration", "protocol_declaration",
         ):
             name_node = parent.child_by_field_name("name")
             parent_symbol = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace") if name_node else ""
@@ -343,6 +373,69 @@ def _find_exportable_definition(node: Node) -> Node | None:
     return None
 
 
+# Accepted right-side types for CommonJS exports
+_CJS_VALUE_TYPES = {"function_expression", "arrow_function", "function", "class", "generator_function"}
+
+
+def _find_commonjs_export(node: Node, content_bytes: bytes) -> tuple[Node, str] | None:
+    """Detect CommonJS export patterns in an expression_statement.
+
+    Returns (value_node, symbol_name) or None.
+    Patterns: module.exports.X = fn, exports.X = fn, module.exports = fn/class/object
+    """
+    for child in node.children:
+        if child.type != "assignment_expression":
+            continue
+
+        left = child.child_by_field_name("left")
+        right = child.child_by_field_name("right")
+        if left is None or right is None or left.type != "member_expression":
+            return None
+
+        left_obj = left.child_by_field_name("object")
+        left_prop = left.child_by_field_name("property")
+        if left_obj is None or left_prop is None:
+            return None
+
+        obj_text = content_bytes[left_obj.start_byte:left_obj.end_byte].decode("utf-8", errors="replace")
+        prop_text = content_bytes[left_prop.start_byte:left_prop.end_byte].decode("utf-8", errors="replace")
+
+        # Pattern: exports.X = fn
+        if left_obj.type == "identifier" and obj_text == "exports":
+            if right.type in _CJS_VALUE_TYPES:
+                return right, prop_text
+            return None
+
+        # Pattern: module.exports.X = fn  OR  module.exports = fn
+        if left_obj.type == "member_expression":
+            # left is module.exports.X — left_obj is module.exports, left_prop is X
+            inner_obj = left_obj.child_by_field_name("object")
+            inner_prop = left_obj.child_by_field_name("property")
+            if inner_obj is None or inner_prop is None:
+                return None
+            inner_obj_text = content_bytes[inner_obj.start_byte:inner_obj.end_byte].decode("utf-8", errors="replace")
+            inner_prop_text = content_bytes[inner_prop.start_byte:inner_prop.end_byte].decode("utf-8", errors="replace")
+            if inner_obj_text == "module" and inner_prop_text == "exports":
+                if right.type in _CJS_VALUE_TYPES:
+                    return right, prop_text
+            return None
+
+        if left_obj.type == "identifier" and obj_text == "module" and prop_text == "exports":
+            # Pattern: module.exports = fn/class/object
+            if right.type in _CJS_VALUE_TYPES:
+                # Prefer the function/class name if it has one
+                name_node = right.child_by_field_name("name")
+                name = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace") if name_node else "module.exports"
+                return right, name
+            if right.type == "object":
+                # Bulk export: module.exports = { ... } — single chunk
+                return right, "module.exports"
+            return None
+
+        return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Class splitting
 # ---------------------------------------------------------------------------
@@ -369,7 +462,7 @@ def _split_class(class_node: Node, content_bytes: bytes, language: str) -> list[
     # Signature chunk (class declaration line + docstring if present)
     sig_text = class_sig
     for child in class_node.children:
-        if child.type in ("block", "class_body", "{"):
+        if child.type in ("block", "class_body", "enum_class_body", "protocol_body", "{"):
             break
         if child.type in ("expression_statement", "comment"):
             sig_text += "\n" + content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
@@ -391,7 +484,7 @@ def _split_class(class_node: Node, content_bytes: bytes, language: str) -> list[
     if body is None:
         # Try finding the body block by type
         for child in class_node.children:
-            if child.type in ("block", "class_body"):
+            if child.type in ("block", "class_body", "enum_class_body", "protocol_body"):
                 body = child
                 break
 

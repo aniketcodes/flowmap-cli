@@ -19,6 +19,7 @@ __pycache__/
 dist/
 build/
 docs/
+issues/
 
 # Tests & coverage
 .pytest_cache/

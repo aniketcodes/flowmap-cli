@@ -159,6 +159,7 @@ def hybrid_search(
     repo_filter: str | None = None,
     reranking_enabled: bool = False,
     reranking_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    regex: bool = False,
 ) -> list[HybridResult]:
     """Run all three search methods in parallel, fuse with weighted RRF, rerank with cross-encoder.
 
@@ -181,7 +182,7 @@ def hybrid_search(
         futures = {}
 
         futures[executor.submit(
-            rg_search, query, repo_paths, limit=50, timeout=15.0
+            rg_search, query, repo_paths, limit=50, timeout=15.0, regex=regex
         )] = "ripgrep"
 
         def _semantic():
