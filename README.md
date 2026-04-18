@@ -49,7 +49,7 @@ Rust | C | C++ | Kotlin | Ruby | PHP | C# | Swift | SQL | GraphQL | Protobuf | T
 ### 1. Install
 
 ```bash
-git clone https://github.com/aniket-agi/flowmap-cli.git
+git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
 uv sync
 ```
@@ -643,7 +643,7 @@ curl http://localhost:11434/api/tags
 
 ```bash
 # Clone
-git clone https://github.com/aniket-agi/flowmap-cli.git
+git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
 
 # Install with dev dependencies
@@ -727,7 +727,7 @@ Contributions are welcome. Here's how to get started:
 ### Setup
 
 ```bash
-git clone https://github.com/aniket-agi/flowmap-cli.git
+git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
 uv sync --extra dev
 ```
