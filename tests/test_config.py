@@ -4,6 +4,8 @@ import pytest
 import yaml
 
 from flowmap.config import (
+    EmbeddingConfig,
+    EmbeddingProfile,
     FlowmapConfig,
     RepoConfig,
     _parse_config_dict,
@@ -64,6 +66,93 @@ class TestParseConfigDict:
         assert cfg.reranking.enabled is False
 
 
+class TestEmbeddingProfiles:
+    """Profile bundles: `active` selects a (backend, model) pair; `profile_name`
+    maps to the store table. Flat config stays back-compatible as the `default`
+    profile so the existing `code_index` table is never orphaned."""
+
+    def test_flat_config_is_default_profile(self):
+        """Legacy flat embedding block → implicit `default` profile."""
+        cfg = _parse_config_dict({
+            "embedding": {"backend": "ollama", "model": "qwen3-embedding:0.6b"},
+        })
+        assert cfg.embedding.active == "default"
+        assert cfg.embedding.profile_name == "default"
+        assert cfg.embedding.model == "qwen3-embedding:0.6b"
+        # Flat form is exposed as a single named profile too
+        assert "default" in cfg.embedding.profiles
+        assert cfg.embedding.profiles["default"].model == "qwen3-embedding:0.6b"
+
+    def test_no_embedding_block_defaults(self):
+        cfg = _parse_config_dict({})
+        assert cfg.embedding.active == "default"
+        assert cfg.embedding.profile_name == "default"
+        assert cfg.embedding.backend == "ollama"
+
+    def test_profiles_map_active_selects_values(self):
+        """Active profile's backend/model/url are reflected on the top-level
+        fields so existing call sites (cfg.embedding.model) keep working."""
+        cfg = _parse_config_dict({
+            "embedding": {
+                "active": "qwen4b",
+                "profiles": {
+                    "qwen06b": {"backend": "ollama", "model": "qwen3-embedding:0.6b"},
+                    "qwen4b": {"backend": "ollama", "model": "qwen3-embedding:4b"},
+                },
+            },
+        })
+        assert cfg.embedding.active == "qwen4b"
+        assert cfg.embedding.profile_name == "qwen4b"
+        assert cfg.embedding.model == "qwen3-embedding:4b"
+        assert cfg.embedding.backend == "ollama"
+        assert set(cfg.embedding.profiles) == {"qwen06b", "qwen4b"}
+        assert cfg.embedding.profiles["qwen06b"].model == "qwen3-embedding:0.6b"
+
+    def test_profiles_map_single_profile_active_optional(self):
+        """One profile, no explicit `active` → that profile is active."""
+        cfg = _parse_config_dict({
+            "embedding": {
+                "profiles": {
+                    "only": {"backend": "ollama", "model": "m1"},
+                },
+            },
+        })
+        assert cfg.embedding.active == "only"
+        assert cfg.embedding.model == "m1"
+
+    def test_profiles_map_missing_active_raises(self):
+        with pytest.raises(ValueError, match="active.*not.*defined|unknown.*profile"):
+            _parse_config_dict({
+                "embedding": {
+                    "active": "ghost",
+                    "profiles": {
+                        "qwen06b": {"backend": "ollama", "model": "m1"},
+                    },
+                },
+            })
+
+    def test_profile_inherits_ollama_url_default(self):
+        cfg = _parse_config_dict({
+            "embedding": {
+                "profiles": {"p": {"model": "m1"}},
+            },
+        })
+        assert cfg.embedding.profiles["p"].ollama_url == "http://localhost:11434"
+        assert cfg.embedding.profiles["p"].backend == "ollama"
+
+
+class TestProfileNameValidation:
+    @pytest.mark.parametrize("bad", ["Bad", "a b", "a.b", "-leading", "_leading", "a__b", "a/b", ""])
+    def test_invalid_profile_name_rejected(self, bad):
+        with pytest.raises(ValueError, match="Invalid embedding profile name"):
+            _parse_config_dict({"embedding": {"active": bad, "profiles": {bad: {"model": "m"}}}})
+
+    @pytest.mark.parametrize("good", ["qwen06b", "qwen-4b", "a", "a_b", "p1"])
+    def test_valid_profile_name_accepted(self, good):
+        cfg = _parse_config_dict({"embedding": {"profiles": {good: {"model": "m"}}}})
+        assert good in cfg.embedding.profiles
+
+
 class TestWriteDefaultConfig:
     def test_creates_config(self, tmp_path):
         path = write_default_config(tmp_path / "config.yaml")
@@ -83,6 +172,42 @@ class TestWriteDefaultConfig:
         write_default_config(path, force=True)
         raw = yaml.safe_load(path.read_text())
         assert any(r["name"] == "keep" for r in raw.get("repos", []))
+
+    def test_force_overwrite_backs_up_and_warns_on_malformed(self, tmp_path, capsys):
+        path = tmp_path / "config.yaml"
+        path.write_text("embedding:\n  profiles:\n    p1: {model: [unterminated\n")  # malformed YAML
+        write_default_config(path, force=True)
+        err = capsys.readouterr().err
+        assert "could not parse existing config" in err
+        # Original content preserved in a .bak rather than silently lost.
+        backup = path.with_suffix(".yaml.bak")
+        assert backup.exists()
+        assert "unterminated" in backup.read_text()
+
+    def test_force_overwrite_preserves_embedding_profiles_and_data_dir(self, tmp_path):
+        """init --force must not destroy a profiles config, custom data_dir, or reranking —
+        even when there are no repos (the gate must not skip preservation)."""
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({
+            "data_dir": "/custom/data",
+            "embedding": {
+                "active": "qwen4b",
+                "profiles": {
+                    "qwen06b": {"backend": "ollama", "model": "qwen3-embedding:0.6b"},
+                    "qwen4b": {"backend": "ollama", "model": "qwen3-embedding:4b"},
+                },
+            },
+            "reranking": {"enabled": True, "model": "my-reranker"},
+        }))
+        write_default_config(path, force=True)
+
+        cfg = load_config(path)
+        assert cfg.embedding.active == "qwen4b"
+        assert set(cfg.embedding.profiles) == {"qwen06b", "qwen4b"}
+        assert cfg.embedding.model == "qwen3-embedding:4b"
+        assert cfg.reranking.enabled is True
+        assert cfg.reranking.model == "my-reranker"
+        assert cfg.data_dir == "/custom/data"
 
 
 class TestAddRepoToConfig:

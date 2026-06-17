@@ -160,6 +160,7 @@ def hybrid_search(
     reranking_enabled: bool = False,
     reranking_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     regex: bool = False,
+    profile: str = "default",
 ) -> list[HybridResult]:
     """Run all three search methods in parallel, fuse with weighted RRF, rerank with cross-encoder.
 
@@ -187,12 +188,12 @@ def hybrid_search(
 
         def _semantic():
             query_vector = embedding_backend.embed_query(query)
-            return store.search_vector(query_vector, limit=30, repo_filter=repo_filter)
+            return store.search_vector(query_vector, limit=30, repo_filter=repo_filter, profile=profile)
         futures[executor.submit(_semantic)] = "semantic"
 
         if query_type in ("identifier", "mixed"):
             futures[executor.submit(
-                store.search_symbol, query, repo_filter, limit=10
+                store.search_symbol, query, repo_filter, limit=10, profile=profile
             )] = "symbol"
 
         try:
@@ -221,7 +222,7 @@ def hybrid_search(
     # Fetch all chunks per unique (repo, file) — turns N serial queries into M (M = unique files)
     _file_chunks_cache: dict[tuple[str, str], list[SearchResult]] = {}
     for repo_file_key in rg_by_file:
-        _file_chunks_cache[repo_file_key] = store.get_chunks_for_file(*repo_file_key)
+        _file_chunks_cache[repo_file_key] = store.get_chunks_for_file(*repo_file_key, profile=profile)
 
     rg_chunk_cache: dict[tuple, SearchResult | None] = {}
     for (repo_name, file_path), file_rg_results in rg_by_file.items():

@@ -13,6 +13,13 @@ import pyarrow as pa
 
 log = logging.getLogger(__name__)
 
+# Row-scan caps. Generous, but warn when hit rather than silently truncate (which
+# would leave orphaned chunks or drop chunk mappings without any signal).
+STALE_FILE_SCAN_CAP = 1_000_000   # distinct-file scan in delete_stale_files
+STALE_CHUNK_SCAN_CAP = 100_000    # per-file chunk-id scan in delete_stale_chunks
+FILE_CHUNKS_CAP = 10_000          # per-file chunk fetch in get_chunks_for_file
+GET_STATS_SCAN_CAP = 100_000      # repo-column scan in get_stats fallback
+
 
 class StoreError(Exception):
     """Raised when a store query fails unexpectedly.
@@ -115,7 +122,9 @@ class VectorStore:
         self._db = lancedb.connect(str(self._db_path))
         self._vector_dims = vector_dims
         self._table_names_cache: list[str] | None = None
-        self._dims_validated: set[str] = set()
+        # Validated (profile, dims) pairs — keyed by dims too so a single store
+        # instance touching tables of different dims can't poison the cache.
+        self._dims_validated: set[tuple[str, int]] = set()
 
     def close(self):
         """Explicit cleanup."""
@@ -144,23 +153,25 @@ class VectorStore:
 
     def _validate_dims(self, table, profile: str = "default"):
         """Check table vector dims match configured dims. Raises StoreError on mismatch."""
-        if profile in self._dims_validated:
+        cache_key = (profile, self._vector_dims)
+        if cache_key in self._dims_validated:
             return
         try:
             schema = table.schema
             vec_field = schema.field("vector")
             table_dims = vec_field.type.list_size
-            if table_dims != self._vector_dims:
-                raise StoreError(
-                    f"Dimension mismatch: index has {table_dims}-dim vectors but "
-                    f"current model produces {self._vector_dims}-dim. "
-                    f"Run: flowmap index --full"
-                )
-        except StoreError:
-            raise
-        except Exception:
-            pass  # schema introspection not critical — skip validation
-        self._dims_validated.add(profile)
+        except Exception as e:
+            # Schema introspection failed — skip WITHOUT caching, so a later call
+            # retries rather than silently trusting an unvalidated table forever.
+            log.warning("Could not validate dims for profile %s: %s (skipping check)", profile, e)
+            return
+        if table_dims != self._vector_dims:
+            raise StoreError(
+                f"Dimension mismatch: index has {table_dims}-dim vectors but "
+                f"current model produces {self._vector_dims}-dim. "
+                f"Run: flowmap index --full"
+            )
+        self._dims_validated.add(cache_key)
 
     def _table_name(self, profile: str = "default") -> str:
         if profile == "default":
@@ -289,22 +300,34 @@ class VectorStore:
         table = self._db.open_table(name)
         table.delete(f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(file)}'")
 
-    def delete_stale_files(self, repo: str, current_files: set[str], profile: str = "default"):
+    def delete_stale_files(self, repo: str, current_files: set[str], profile: str = "default") -> bool:
         """Delete chunks for files no longer present in the repo.
 
         Used after upsert-first full reindex to clean up stale data without
         a delete-everything-first approach (which has a data-loss window).
+
+        Returns True on success, False if cleanup failed (so the caller can keep
+        the pending marker set and force a full reindex next run, rather than
+        clearing it and leaving orphaned chunks unnoticed).
         """
         name = self._table_name(profile)
         if name not in self._list_table_names():
-            return
+            return True
 
         try:
             table = self._db.open_table(name)
-            # Get distinct files currently stored for this repo
+            # Get distinct files currently stored for this repo. A fixed limit would
+            # silently miss stale files in very large repos (leaving orphaned chunks),
+            # so cap generously and warn if we hit it rather than truncate silently.
             rows = table.search().select(["file"]).where(
                 f"repo = '{_escape_sql(repo)}'"
-            ).limit(100000).to_list()
+            ).limit(STALE_FILE_SCAN_CAP).to_list()
+            cap_hit = len(rows) >= STALE_FILE_SCAN_CAP
+            if cap_hit:
+                log.warning(
+                    "delete_stale_files: repo %s has >= %d chunks; stale-file scan may be "
+                    "incomplete and orphaned chunks could remain.", repo, STALE_FILE_SCAN_CAP
+                )
             stored_files = {r["file"] for r in rows}
 
             stale_files = stored_files - current_files
@@ -312,32 +335,48 @@ class VectorStore:
                 table.delete(f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(f)}'")
             if stale_files:
                 log.info("Deleted %d stale files for repo %s", len(stale_files), repo)
+            # If we hit the scan cap, cleanup is known-incomplete — report failure so
+            # the caller keeps the pending marker and forces a full reindex next run.
+            return not cap_hit
         except Exception as e:
             log.warning("delete_stale_files failed for %s: %s (stale chunks may remain)", repo, e)
+            return False
 
-    def delete_stale_chunks(self, repo: str, file: str, valid_ids: set[str], profile: str = "default"):
+    def delete_stale_chunks(self, repo: str, file: str, valid_ids: set[str], profile: str = "default") -> bool:
         """Delete chunks for a specific file whose IDs are not in the valid set.
 
         Used after upsert-first incremental reindex: new chunks are upserted via
         merge_insert, then this cleans up stale IDs (removed symbols, reordered chunks).
         If crash occurs before this runs, stale chunks remain but no data is lost.
+
+        Returns True on success, False if cleanup is known-incomplete (scan cap hit)
+        or failed — so the caller keeps the pending marker and forces a full reindex
+        next run rather than silently leaving orphaned chunks.
         """
         name = self._table_name(profile)
         if name not in self._list_table_names():
-            return
+            return True
 
         try:
             table = self._db.open_table(name)
             rows = table.search().select(["id"]).where(
                 f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(file)}'"
-            ).limit(10000).to_list()
+            ).limit(STALE_CHUNK_SCAN_CAP).to_list()
+            cap_hit = len(rows) >= STALE_CHUNK_SCAN_CAP
+            if cap_hit:
+                log.warning(
+                    "delete_stale_chunks: %s/%s has >= %d chunks; stale-chunk scan may be "
+                    "incomplete and orphaned chunks could remain.", repo, file, STALE_CHUNK_SCAN_CAP
+                )
             stale_ids = [r["id"] for r in rows if r["id"] not in valid_ids]
             for sid in stale_ids:
                 table.delete(f"id = '{_escape_sql(sid)}'")
             if stale_ids:
                 log.debug("Deleted %d stale chunks for %s/%s", len(stale_ids), repo, file)
+            return not cap_hit
         except Exception as e:
             log.warning("delete_stale_chunks failed for %s/%s: %s", repo, file, e)
+            return False
 
     # -- search operations ---------------------------------------------------
 
@@ -502,7 +541,12 @@ class VectorStore:
         where = f"repo = '{_escape_sql(repo)}' AND file = '{_escape_sql(file)}'"
 
         try:
-            rows = table.search().where(where).limit(1000).to_list()
+            rows = table.search().where(where).limit(FILE_CHUNKS_CAP).to_list()
+            if len(rows) >= FILE_CHUNKS_CAP:
+                log.warning(
+                    "get_chunks_for_file: %s/%s has >= %d chunks; some ripgrep hits may not "
+                    "map to a chunk and fusion may be degraded.", repo, file, FILE_CHUNKS_CAP
+                )
             chunks = [self._row_to_result(r) for r in rows]
             chunks.sort(key=lambda c: c.start_line)
             return chunks
@@ -534,7 +578,12 @@ class VectorStore:
         else:
             # Fallback: read just repo column (lighter than full table)
             try:
-                rows = table.search().select(["repo"]).limit(min(total, 100000)).to_list()
+                rows = table.search().select(["repo"]).limit(min(total, GET_STATS_SCAN_CAP)).to_list()
+                if total > GET_STATS_SCAN_CAP:
+                    log.warning(
+                        "get_stats: table %s has %d chunks (> %d cap); per-repo counts "
+                        "are truncated and may under-report.", name, total, GET_STATS_SCAN_CAP
+                    )
                 from collections import Counter
                 repo_counts = dict(Counter(r["repo"] for r in rows))
             except Exception as e:

@@ -46,7 +46,7 @@ class TestBuildTimeline:
         store = MagicMock()
         store.search_symbol.return_value = []
         tl = build_timeline("query", {"repo1": "/r1", "repo2": "/r2"}, store, repo_filter="repo1")
-        store.search_symbol.assert_called_once_with("query", repo_filter="repo1", limit=10)
+        store.search_symbol.assert_called_once_with("query", repo_filter="repo1", limit=10, profile="default")
 
     def test_respects_limit(self):
         store = MagicMock()

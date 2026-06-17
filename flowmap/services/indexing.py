@@ -66,6 +66,7 @@ def _full_index_repo(
     git_branch: str,
     on_progress: Callable[[int, int], None] | None = None,
     on_msg: Callable[[str], None] | None = None,
+    profile: str = "default",
 ) -> IndexResult:
     """Run a full re-index for a single repo."""
     # Step 1: Chunk and embed FIRST (failure-prone step — no store mutations yet)
@@ -80,23 +81,35 @@ def _full_index_repo(
     # Step 2: Upsert new data FIRST, then clean up stale chunks.
     # This closes the data-loss window: if we crash after upsert but before
     # cleanup, we have stale+new data (no loss). Pending marker handles recovery.
-    state.set_meta(f"pending:{repo_name}", git_sha)
-    store.upsert_chunks(chunks, all_embeddings)
+    state.set_meta(f"pending:{repo_name}", git_sha, profile)
+    store.upsert_chunks(chunks, all_embeddings, profile=profile)
 
     # Step 3: Delete chunks for files no longer in the repo
     new_files = {c["file"] for c in chunks}
-    store.delete_stale_files(repo_name, new_files)
+    stale_cleanup_ok = store.delete_stale_files(repo_name, new_files, profile=profile)
 
-    state.set_meta("embedding_model", backend.model_name())
-    state.set_meta("embedding_dims", str(backend.dims()))
-    state.update_repo_indexed(
-        name=repo_name,
-        sha=git_sha,
-        branch=git_branch,
-        chunk_count=len(chunks),
-    )
-    # Clear pending marker AFTER successful state update
-    state.set_meta(f"pending:{repo_name}", "")
+    state.set_meta("embedding_model", backend.model_name(), profile)
+    state.set_meta("embedding_dims", str(backend.dims()), profile)
+    state.set_repo_index(repo_name, sha=git_sha, branch=git_branch, chunks=len(chunks), profile=profile)
+    # Mirror to the global repos table ONLY for the legacy default profile (back-compat).
+    # Non-default profiles are fully tracked in per-profile meta, so writing the shared
+    # row would just reintroduce last-writer-wins poisoning across profiles.
+    if profile == "default":
+        state.update_repo_indexed(
+            name=repo_name,
+            sha=git_sha,
+            branch=git_branch,
+            chunk_count=len(chunks),
+        )
+    # Clear the pending marker only if stale cleanup succeeded. If it failed, the
+    # upsert still landed (no data loss), but orphaned chunks may remain — leaving
+    # the marker set forces a clean full reindex on the next run instead of
+    # silently clearing it and letting the orphans persist unnoticed.
+    if stale_cleanup_ok:
+        state.set_meta(f"pending:{repo_name}", "", profile)
+    elif on_msg:
+        on_msg(f"  Warning: stale-chunk cleanup failed for {repo_name}; "
+               f"will force a full reindex next run.")
 
     return IndexResult(repo_name, "full", len(chunks), f"{len(chunks)} chunks indexed")
 
@@ -109,12 +122,16 @@ def run_index(
     full: bool = False,
     on_message: Callable[[str], None] | None = None,
     on_embed_progress: Callable[[int, int], None] | None = None,
+    profile: str = "default",
 ) -> list[IndexResult]:
-    """Index one or more repos. Returns per-repo results.
+    """Index one or more repos into `profile`'s table. Returns per-repo results.
 
     Does NOT rebuild FTS/vector indexes — caller should do that once after.
     on_message(msg) is called for status updates (progress, warnings).
     on_embed_progress(batch_idx, total) is called per embedding batch.
+
+    Staleness is tracked per profile, so indexing one embedding model never
+    marks another model's index as fresh.
     """
     msg = on_message or (lambda m: None)
     results: list[IndexResult] = []
@@ -128,14 +145,16 @@ def run_index(
 
         state.upsert_repo(t.name, str(resolved))
 
-        # Get current git status
+        # Get current git status. Staleness is read from this profile's own
+        # records; for the legacy `default` profile, fall back to the global
+        # repos table so pre-profile indexes aren't needlessly re-indexed.
         git_status = get_git_status(str(resolved))
-        repo_info = state.get_repo(t.name)
-        stored_sha = repo_info.get("last_indexed_sha") if repo_info else None
-        stored_branch = repo_info.get("last_indexed_branch") if repo_info else None
+        idx = state.get_repo_index(t.name, profile)
+        stored_sha = idx["sha"]
+        stored_branch = idx["branch"]
 
         # Check for interrupted previous index
-        pending = state.get_meta(f"pending:{t.name}")
+        pending = state.get_meta(f"pending:{t.name}", profile)
         force_full = bool(pending)
         if pending:
             msg(f"  {t.name}: interrupted previous index — forcing full re-index")
@@ -165,7 +184,7 @@ def run_index(
             msg(f"Indexing {t.name} ({resolved}) [full, {git_branch or 'unknown'}]...")
             result = _full_index_repo(
                 t.name, str(resolved), store, state, backend,
-                git_sha, git_branch, on_embed_progress, on_msg=msg,
+                git_sha, git_branch, on_embed_progress, on_msg=msg, profile=profile,
             )
             msg(f"  Done: {t.name} ({result.message})")
             results.append(result)
@@ -183,6 +202,7 @@ def run_index(
                 embedding_backend=backend,
                 state_db=state,
                 on_progress=lambda m: msg(f"  {m}"),
+                profile=profile,
             )
 
             if inc_result.mode == "full":
@@ -190,7 +210,7 @@ def run_index(
                 msg(f"  {inc_result.reason} — running full re-index...")
                 result = _full_index_repo(
                     t.name, str(resolved), store, state, backend,
-                    git_sha, git_branch, on_embed_progress, on_msg=msg,
+                    git_sha, git_branch, on_embed_progress, on_msg=msg, profile=profile,
                 )
                 msg(f"  Done: {t.name} ({result.chunks} chunks, full re-index)")
                 results.append(result)
