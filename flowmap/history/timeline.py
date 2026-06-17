@@ -54,9 +54,10 @@ def _scope_from_symbol_search(
     query: str,
     store: VectorStore,
     repo_filter: str | None = None,
+    profile: str = "default",
 ) -> list[tuple[str, str, str]]:
     """Use symbol search to find relevant (repo, file, symbol) tuples."""
-    results = store.search_symbol(query, repo_filter=repo_filter, limit=10)
+    results = store.search_symbol(query, repo_filter=repo_filter, limit=10, profile=profile)
     return _dedupe_results_to_scope(results)
 
 
@@ -65,11 +66,12 @@ def _scope_from_vector_search(
     store: VectorStore,
     embedding_backend,
     repo_filter: str | None = None,
+    profile: str = "default",
 ) -> list[tuple[str, str, str]]:
     """Fallback: use vector search to find relevant (repo, file, symbol) tuples."""
     try:
         query_vector = embedding_backend.embed_query(query)
-        results = store.search_vector(query_vector, limit=10, repo_filter=repo_filter)
+        results = store.search_vector(query_vector, limit=10, repo_filter=repo_filter, profile=profile)
     except Exception as e:
         log.debug("Vector fallback failed during history scope: %s", e)
         return []
@@ -108,6 +110,7 @@ def build_timeline(
     repo_filter: str | None = None,
     symbol_filter: str | None = None,
     embedding_backend=None,
+    profile: str = "default",
 ) -> Timeline:
     """Build a timeline of structural changes for a query.
 
@@ -121,11 +124,11 @@ def build_timeline(
 
     # --- Step 1: Scope resolution ---
     search_term = symbol_filter or query
-    scoped = _scope_from_symbol_search(search_term, store, repo_filter)
+    scoped = _scope_from_symbol_search(search_term, store, repo_filter, profile)
 
     if not scoped and embedding_backend is not None:
         log.debug("Symbol search found nothing for '%s', falling back to vector search", search_term)
-        scoped = _scope_from_vector_search(search_term, store, embedding_backend, repo_filter)
+        scoped = _scope_from_vector_search(search_term, store, embedding_backend, repo_filter, profile)
 
     if not scoped:
         return timeline

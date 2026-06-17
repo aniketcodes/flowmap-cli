@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,10 +68,30 @@ class RepoConfig:
 
 
 @dataclass
-class EmbeddingConfig:
+class EmbeddingProfile:
+    """A named (backend, model) bundle. Each profile maps to its own store table
+    (`code_index__<name>`), so different embedding models coexist on disk."""
     backend: str = "ollama"
     model: str = "qwen3-embedding:0.6b"
     ollama_url: str = "http://localhost:11434"
+
+
+@dataclass
+class EmbeddingConfig:
+    # Active profile's values — kept at the top level so callers can read
+    # cfg.embedding.model/.backend/.ollama_url without knowing about profiles.
+    backend: str = "ollama"
+    model: str = "qwen3-embedding:0.6b"
+    ollama_url: str = "http://localhost:11434"
+    # The selected profile name and the full set of defined profiles.
+    active: str = "default"
+    profiles: dict[str, EmbeddingProfile] = field(default_factory=dict)
+
+    @property
+    def profile_name(self) -> str:
+        """Slug used to scope the store table. The legacy flat config maps to
+        `default`, which the store renders as the original `code_index` table."""
+        return self.active
 
 
 @dataclass
@@ -107,18 +128,86 @@ class FlowmapConfig:
 # Loading
 # ---------------------------------------------------------------------------
 
+_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _validate_profile_name(name: str) -> None:
+    """Profile names become LanceDB table suffixes (`code_index__<name>`). Restrict
+    to a safe slug and reject `__` (which would make the table-name round-trip
+    ambiguous in list_profiles)."""
+    if not isinstance(name, str) or not _PROFILE_NAME_RE.match(name) or "__" in name:
+        raise ValueError(
+            f"Invalid embedding profile name {name!r}: must match [a-z0-9][a-z0-9_-]* "
+            f"and not contain '__'."
+        )
+
+
+def _parse_embedding_profile(raw: dict) -> EmbeddingProfile:
+    return EmbeddingProfile(
+        backend=raw.get("backend", EmbeddingProfile.backend),
+        model=raw.get("model", EmbeddingProfile.model),
+        ollama_url=raw.get("ollama_url", EmbeddingProfile.ollama_url),
+    )
+
+
+def _parse_embedding(emb_raw: dict) -> EmbeddingConfig:
+    """Parse the `embedding` block. Two forms are accepted:
+
+    Flat (legacy):   {backend, model, ollama_url}  → single `default` profile.
+    Profiles map:    {active, profiles: {name: {backend, model, ...}}}.
+
+    In both cases the active profile's values are mirrored onto the top-level
+    backend/model/ollama_url fields for backward-compatible access.
+    """
+    profiles_raw = emb_raw.get("profiles")
+
+    if not profiles_raw:
+        # Flat / legacy form — expose it as the implicit `default` profile.
+        prof = _parse_embedding_profile(emb_raw)
+        return EmbeddingConfig(
+            backend=prof.backend,
+            model=prof.model,
+            ollama_url=prof.ollama_url,
+            active="default",
+            profiles={"default": prof},
+        )
+
+    for name in profiles_raw:
+        _validate_profile_name(name)
+    profiles = {name: _parse_embedding_profile(p or {}) for name, p in profiles_raw.items()}
+
+    active = emb_raw.get("active")
+    if active is None:
+        if len(profiles) == 1:
+            active = next(iter(profiles))
+        else:
+            raise ValueError(
+                "embedding.active must be set when multiple profiles are defined. "
+                f"Available profiles: {sorted(profiles)}"
+            )
+    if active not in profiles:
+        raise ValueError(
+            f"embedding.active '{active}' is not defined in profiles. "
+            f"Available profiles: {sorted(profiles)}"
+        )
+
+    sel = profiles[active]
+    return EmbeddingConfig(
+        backend=sel.backend,
+        model=sel.model,
+        ollama_url=sel.ollama_url,
+        active=active,
+        profiles=profiles,
+    )
+
+
 def _parse_config_dict(raw: dict) -> FlowmapConfig:
     repos = [
         RepoConfig(name=r["name"], path=r["path"])
-        for r in raw.get("repos", [])
+        for r in (raw.get("repos") or [])  # `repos:` with null value → []
     ]
 
-    emb_raw = raw.get("embedding", {})
-    embedding = EmbeddingConfig(
-        backend=emb_raw.get("backend", EmbeddingConfig.backend),
-        model=emb_raw.get("model", EmbeddingConfig.model),
-        ollama_url=emb_raw.get("ollama_url", EmbeddingConfig.ollama_url),
-    )
+    embedding = _parse_embedding(raw.get("embedding") or {})
 
     rer_raw = raw.get("reranking", {})
     reranking = RerankingConfig(
@@ -193,6 +282,19 @@ embedding:
   # To use sentence-transformers instead (requires pip install flowmap[local-embeddings]):
   # backend: sentence-transformers
   # model: nomic-ai/CodeRankEmbed
+  #
+  # To keep several models indexed side by side, use named profiles instead of
+  # the flat form above. Each profile is a separate on-disk index; flip `active`
+  # to switch models without re-indexing (index each profile once):
+  #
+  # active: qwen06b
+  # profiles:
+  #   qwen06b:
+  #     backend: ollama
+  #     model: qwen3-embedding:0.6b
+  #   qwen4b:
+  #     backend: ollama
+  #     model: qwen3-embedding:4b
 
 reranking:
   enabled: false                        # adds ~10s latency (loads PyTorch). Use --rerank flag for quality-critical queries.
@@ -209,22 +311,38 @@ def write_default_config(config_path: Path | None = None, force: bool = False) -
     if path.exists() and not force:
         raise FileExistsError(f"Config already exists: {path}")
 
-    # Preserve existing repos if force-overwriting
-    existing_repos = []
+    # Preserve the user's existing settings when force-overwriting. Capture the
+    # WHOLE prior dict (not just repos) so a profiles config, custom data_dir, and
+    # reranking block survive `flowmap init --force` — even with no repos.
+    preserved: dict = {}
     if force and path.exists():
         try:
             with open(path, "r") as f:
-                raw = yaml.safe_load(f) or {}
-            existing_repos = raw.get("repos") or []
-        except Exception:
-            pass
+                prior = yaml.safe_load(f) or {}
+            for key in ("repos", "data_dir", "embedding", "reranking"):
+                if prior.get(key):
+                    preserved[key] = prior[key]
+        except Exception as e:
+            # Don't SILENTLY wipe an unparseable config (the very case where a user
+            # runs init --force to fix it) — back it up and warn so profiles aren't
+            # lost without a trace.
+            backup = path.with_suffix(path.suffix + ".bak")
+            try:
+                backup.write_text(path.read_text())
+            except Exception:
+                backup = None
+            import sys
+            where = f" (backed up to {backup})" if backup else ""
+            sys.stderr.write(
+                f"Warning: could not parse existing config ({e}); writing a fresh one"
+                f"{where}. Your previous settings were not migrated.\n"
+            )
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if existing_repos:
-        # Write template then inject repos
+    if preserved:
         raw = yaml.safe_load(DEFAULT_CONFIG_TEMPLATE) or {}
-        raw["repos"] = existing_repos
+        raw.update(preserved)
         with open(path, "w") as f:
             yaml.dump(raw, f, default_flow_style=False, sort_keys=False)
     else:

@@ -2,8 +2,113 @@
 
 import pytest
 
-from flowmap.store import VectorStore, make_chunk_id
+from flowmap.store import StoreError, VectorStore, make_chunk_id
 from tests.conftest import DIMS, hash_vector
+
+
+def test_get_chunks_for_file_warns_when_cap_hit(tmp_path, monkeypatch, caplog):
+    """Hitting the per-file chunk cap must warn, not silently drop chunk mappings."""
+    import logging
+    import flowmap.store as store_mod
+    monkeypatch.setattr(store_mod, "FILE_CHUNKS_CAP", 2)
+    s = VectorStore(tmp_path / "lancedb", vector_dims=DIMS)
+    chunks, embs = _make_chunks("r", "a.py", ["f1", "f2", "f3"])  # 3 > cap of 2
+    s.upsert_chunks(chunks, embs)
+    with caplog.at_level(logging.WARNING):
+        s.get_chunks_for_file("r", "a.py")
+    assert any("get_chunks_for_file" in r.message and ">=" in r.message for r in caplog.records)
+    s.close()
+
+
+def test_delete_stale_chunks_returns_bool(tmp_path, monkeypatch):
+    """Incremental cleanup must SIGNAL failure (like delete_stale_files) so the
+    caller keeps the pending marker instead of clearing it over orphaned chunks."""
+    s = VectorStore(tmp_path / "lancedb", vector_dims=DIMS)
+    chunks, embs = _make_chunks("r", "a.py", ["f1", "f2"])
+    s.upsert_chunks(chunks, embs)
+
+    # Success → True
+    assert s.delete_stale_chunks("r", "a.py", valid_ids={chunks[0]["id"], chunks[1]["id"]}) is True
+
+    # Cap hit → False (known-incomplete scan)
+    import flowmap.store as store_mod
+    monkeypatch.setattr(store_mod, "STALE_CHUNK_SCAN_CAP", 1)
+    assert s.delete_stale_chunks("r", "a.py", valid_ids=set()) is False
+    monkeypatch.undo()
+
+    # Exception during delete → False
+    real_open = s._db.open_table
+    def boom(name):
+        t = real_open(name)
+        monkeypatch.setattr(t, "delete", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")))
+        return t
+    monkeypatch.setattr(s._db, "open_table", boom)
+    assert s.delete_stale_chunks("r", "a.py", valid_ids=set()) is False
+    s.close()
+
+
+def test_delete_stale_files_returns_false_when_cap_hit(tmp_path, monkeypatch):
+    """Hitting the scan cap means cleanup is known-incomplete → return False so the
+    caller keeps the pending marker (rather than silently leaving orphans)."""
+    import flowmap.store as store_mod
+    monkeypatch.setattr(store_mod, "STALE_FILE_SCAN_CAP", 1)
+    s = VectorStore(tmp_path / "lancedb", vector_dims=DIMS)
+    chunks, embs = _make_chunks("r", "a.py", ["f1", "f2"])  # 2 rows >= cap of 1
+    s.upsert_chunks(chunks, embs)
+    assert s.delete_stale_files("r", {"a.py"}, profile="default") is False
+    s.close()
+
+
+def test_get_stats_fallback_warns_when_truncated(tmp_path, monkeypatch, caplog):
+    import logging
+    import flowmap.store as store_mod
+    monkeypatch.setattr(store_mod, "GET_STATS_SCAN_CAP", 1)
+    s = VectorStore(tmp_path / "lancedb", vector_dims=DIMS)
+    chunks, embs = _make_chunks("r", "a.py", ["f1", "f2"])  # total 2 > cap 1
+    s.upsert_chunks(chunks, embs)
+    with caplog.at_level(logging.WARNING):
+        s.get_stats()  # no known_repos → fallback path
+    assert any("get_stats" in r.message and "truncated" in r.message for r in caplog.records)
+    s.close()
+
+
+def test_delete_stale_files_returns_false_on_failure(tmp_path, monkeypatch):
+    """Cleanup failure must be signalled (False), not swallowed silently — so the
+    caller can keep the pending marker and force a full reindex next run."""
+    s = VectorStore(tmp_path / "lancedb", vector_dims=DIMS)
+    chunks, embs = _make_chunks("r", "a.py", ["f1"])
+    s.upsert_chunks(chunks, embs)
+
+    real_open = s._db.open_table
+    def boom(name):
+        t = real_open(name)
+        monkeypatch.setattr(t, "delete", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")))
+        return t
+    monkeypatch.setattr(s._db, "open_table", boom)
+
+    # current_files omits a.py → it's stale → delete attempted → raises → False
+    assert s.delete_stale_files("r", set(), profile="default") is False
+    s.close()
+
+
+def test_search_raises_on_dimension_mismatch(tmp_path):
+    """A table built at one dim, queried by a store configured for another dim,
+    must raise StoreError — the automated guard for switching profiles whose
+    embedding models have different vector sizes (e.g. qwen 0.6b=1024 vs 4b=2560)."""
+    path = tmp_path / "lancedb"
+    chunk = {
+        "id": make_chunk_id(repo="r", file="a.py", symbol_name="f", chunk_type="function", chunk_index=0),
+        "repo": "r", "file": "a.py", "file_name": "a.py", "extension": ".py",
+        "language": "python", "chunk_type": "function", "symbol_name": "f",
+        "signature": "def f():", "parent_symbol": "", "parent_signature": "",
+        "start_line": 1, "end_line": 3, "chunk_index": 0, "text": "def f(): pass",
+    }
+    with VectorStore(path, vector_dims=8) as s:
+        s.upsert_chunks([chunk], [hash_vector("r:a.py:f", 8)])
+    # Reopen the same table with a different configured dim → mismatch on query.
+    with VectorStore(path, vector_dims=16) as s:
+        with pytest.raises(StoreError):
+            s.search_vector(hash_vector("r:a.py:f", 16), limit=5)
 
 
 def _make_chunks(repo: str, file: str, symbols: list[str]) -> tuple[list[dict], list[list[float]]]:

@@ -79,6 +79,51 @@ def test_hybrid_no_results(mock_rg):
 
 
 # ---------------------------------------------------------------------------
+# Profile threading
+# ---------------------------------------------------------------------------
+
+@patch("flowmap.search.hybrid.rg_search", return_value=[])
+def test_hybrid_forwards_profile_to_store(mock_rg):
+    """A non-default profile must reach every store call so the right table is queried."""
+    backend = _make_mock_backend()
+    store = _make_mock_store(
+        semantic_results=[_mock_search_result(symbol="auth_handler", score=0.9)],
+        symbol_results=[_mock_search_result(symbol="getToken", score=0.5)],
+    )
+
+    hybrid_search(
+        query="getToken",  # identifier → triggers symbol search too
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        reranking_enabled=False,
+        profile="qwen4b",
+    )
+
+    assert store.search_vector.call_args.kwargs.get("profile") == "qwen4b"
+    assert store.search_symbol.call_args.kwargs.get("profile") == "qwen4b"
+
+
+@patch("flowmap.search.hybrid.rg_search", return_value=[])
+def test_hybrid_defaults_to_default_profile(mock_rg):
+    """Omitting profile preserves legacy behaviour (default table)."""
+    backend = _make_mock_backend()
+    store = _make_mock_store(semantic_results=[_mock_search_result(score=0.9)])
+
+    hybrid_search(
+        query="how does auth work",
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        reranking_enabled=False,
+    )
+
+    assert store.search_vector.call_args.kwargs.get("profile") == "default"
+
+
+# ---------------------------------------------------------------------------
 # Source merging
 # ---------------------------------------------------------------------------
 
