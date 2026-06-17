@@ -33,11 +33,11 @@ log = logging.getLogger(__name__)
 
 
 def _get_stored_dims(cfg: FlowmapConfig) -> int:
-    """Read stored embedding dims from StateDB, default 1024."""
+    """Read stored embedding dims for the active profile from StateDB, default 1024."""
     from flowmap.state import StateDB
     try:
         with StateDB(cfg.db_path) as state:
-            stored = state.get_meta("embedding_dims")
+            stored = state.get_meta("embedding_dims", cfg.embedding.profile_name)
             return int(stored) if stored else 1024
     except (sqlite3.DatabaseError, ValueError, OSError) as e:
         log.warning("Could not read stored embedding dims: %s (defaulting to 1024)", e)
@@ -170,17 +170,30 @@ def repos_list(ctx):
         return
 
     from flowmap.state import StateDB
+    from flowmap.store import VectorStore
+
+    profile = cfg.embedding.profile_name
+    # Live per-profile chunk counts; degrade to state-only if the store can't open
+    # (keep this command robust — it was StateDB-only before).
+    chunk_counts: dict[str, int] = {}
+    try:
+        with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
+            chunk_counts = store.get_stats(profile=profile, known_repos=[r.name for r in cfg.repos]).get("repos", {})
+    except Exception:
+        pass
+
     with StateDB(cfg.db_path) as state:
+        click.echo(f"Repos [profile: {profile}]:")
         for repo in cfg.repos:
             path_ok = repo.resolved_path().is_dir()
-            info = state.get_repo(repo.name)
+            idx = state.get_repo_index(repo.name, profile)
             if not path_ok:
                 marker = click.style("!", fg="red")
                 click.echo(f"  {marker} {repo.name:<28} path missing: {repo.path}")
-            elif info and info.get("last_indexed_at"):
+            elif idx["sha"]:
                 status = click.style("indexed", fg="green")
-                chunks = info.get("chunk_count", 0)
-                when = info["last_indexed_at"][:10]
+                chunks = chunk_counts.get(repo.name, 0)
+                when = (idx["indexed_at"] or "")[:10]
                 click.echo(f"    {repo.name:<28} {status}  {chunks:>6} chunks  {when}")
             else:
                 status = click.style("not indexed", fg="yellow")
@@ -218,8 +231,10 @@ def repos_remove(ctx, name, keep_data):
         from flowmap.store import VectorStore
         try:
             with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
-                store.delete_by_repo(name)
-                state.delete_repo(name)
+                # Delete the repo's chunks from every profile table, not just default.
+                for prof in store.list_profiles():
+                    store.delete_by_repo(name, profile=prof)
+                state.delete_repo(name)  # also clears per-profile staleness (atomic)
         except Exception as e:
             click.echo(f"Warning: could not clean index data: {e}", err=True)
 
@@ -266,7 +281,8 @@ def index(ctx, repo, full, dry_run):
         from flowmap.indexer import _git_tracked_files
         from flowmap.reindex import get_git_status
         from flowmap.state import StateDB
-        click.echo("Dry run — showing what would be indexed:\n")
+        profile = cfg.embedding.profile_name
+        click.echo(f"Dry run — showing what would be indexed [profile: {profile}]:\n")
         with StateDB(cfg.db_path) as state:
             for t in targets:
                 resolved = t.resolved_path()
@@ -274,8 +290,7 @@ def index(ctx, repo, full, dry_run):
                     click.echo(f"  {t.name}: path missing ({resolved})")
                     continue
                 git_status = get_git_status(str(resolved))
-                repo_info = state.get_repo(t.name)
-                stored_sha = repo_info.get("last_indexed_sha") if repo_info else None
+                stored_sha = state.get_repo_index(t.name, profile)["sha"]
                 if stored_sha and git_status and stored_sha == git_status.sha and not full:
                     click.echo(f"  {t.name}: up to date ({git_status.branch}, {git_status.sha[:7]})")
                 else:
@@ -305,7 +320,8 @@ def index(ctx, repo, full, dry_run):
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    click.echo(f"Embedding: {backend.model_name()} ({backend.dims()} dims)")
+    profile = cfg.embedding.profile_name
+    click.echo(f"Embedding: {backend.model_name()} ({backend.dims()} dims) [profile: {profile}]")
 
     # Acquire process-level lock to prevent concurrent index corruption
     lock_path = cfg.data_path / ".flowmap.lock"
@@ -316,12 +332,19 @@ def index(ctx, repo, full, dry_run):
 
     try:
         with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=backend.dims()) as store:
-            # Check model consistency
-            stored_model = state.get_meta("embedding_model")
+            # Check model consistency *within this profile*. Switching models is
+            # done by switching profiles (separate tables), so a mismatch here
+            # means the profile's own model definition changed under it.
+            stored_model = state.get_meta("embedding_model", profile)
             if stored_model and stored_model != backend.model_name():
-                if not full:
+                # If the profile has no data (e.g. after `reset --repo` emptied it),
+                # there's nothing to be inconsistent with — allow the switch without
+                # forcing --full.
+                profile_empty = store.get_stats(profile=profile).get("total", 0) == 0
+                if not full and not profile_empty:
                     click.echo(
-                        f"Error: model changed ({stored_model} -> {backend.model_name()}). "
+                        f"Error: model for profile '{profile}' changed "
+                        f"({stored_model} -> {backend.model_name()}). "
                         f"Run with --full to re-index.",
                         err=True,
                     )
@@ -334,13 +357,14 @@ def index(ctx, repo, full, dry_run):
                 targets=targets,
                 full=full,
                 on_message=lambda msg: click.echo(msg),
+                profile=profile,
             )
 
             # Rebuild FTS and vector indexes once after all repos
             click.echo("Rebuilding search indexes...")
-            store.rebuild_fts_index()
-            store.rebuild_vector_index()
-            store.compact()
+            store.rebuild_fts_index(profile)
+            store.rebuild_vector_index(profile)
+            store.compact(profile)
             click.echo("Done.")
     finally:
         _release_index_lock(lock_fd)
@@ -415,6 +439,30 @@ def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
     try:
       with VectorStore(cfg.lancedb_path, vector_dims=store_dims) as store:
 
+        # Warn loudly when the active profile has no index — otherwise empty
+        # results look like "no matches" rather than "this model isn't indexed".
+        active_profile = cfg.embedding.profile_name
+        if fmt != "json" and active_profile not in store.list_profiles():
+            click.echo(
+                f"Warning: profile '{active_profile}' is not indexed. "
+                f"Run: flowmap index",
+                err=True,
+            )
+        # Warn on model drift: the profile was indexed with a different model than
+        # config now points at. Dims still validate, but a same-dim swap silently
+        # queries the wrong vectors. Only meaningful when we embed (backend exists).
+        elif fmt != "json" and backend is not None:
+            from flowmap.state import StateDB
+            with StateDB(cfg.db_path) as _state:
+                stored_model = _state.get_meta("embedding_model", active_profile)
+            if stored_model and stored_model != backend.model_name():
+                click.echo(
+                    f"Warning: profile '{active_profile}' was indexed with "
+                    f"{stored_model}, but config now uses {backend.model_name()}. "
+                    f"Re-index or results will be wrong.",
+                    err=True,
+                )
+
         # --- Hybrid mode (default): 3-way fusion ---
         if mode == "hybrid":
             from flowmap.search.hybrid import hybrid_search
@@ -433,6 +481,7 @@ def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
                 reranking_enabled=rerank or cfg.reranking.enabled,
                 reranking_model=cfg.reranking.model,
                 regex=use_regex,
+                profile=cfg.embedding.profile_name,
             )
 
             if not results:
@@ -446,7 +495,7 @@ def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
         # --- Semantic only ---
         elif mode == "semantic":
             query_vector = backend.embed_query(query)
-            results = store.search_vector(query_vector, limit=limit, repo_filter=repo)
+            results = store.search_vector(query_vector, limit=limit, repo_filter=repo, profile=cfg.embedding.profile_name)
 
             if not results:
                 if fmt == "json":
@@ -458,7 +507,7 @@ def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
 
         # --- Symbol lookup ---
         elif mode == "symbol":
-            results = store.search_symbol(query, repo_filter=repo, limit=limit)
+            results = store.search_symbol(query, repo_filter=repo, limit=limit, profile=cfg.embedding.profile_name)
             if not results:
                 if fmt == "json":
                     click.echo(render_symbol_results([], query, fmt))
@@ -492,7 +541,7 @@ def repo_map(ctx, repo, fmt):
 
     try:
         with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
-            rows, truncated = store.get_repo_map(repo=repo)
+            rows, truncated = store.get_repo_map(repo=repo, profile=cfg.embedding.profile_name)
 
             if not rows:
                 if fmt == "json":
@@ -534,7 +583,7 @@ def symbols(ctx, query, repo, kind, limit, fmt):
 
     try:
         with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
-            rows = store.get_symbols(query=query, repo=repo, kind=kind, limit=limit)
+            rows = store.get_symbols(query=query, repo=repo, kind=kind, limit=limit, profile=cfg.embedding.profile_name)
 
             if not rows:
                 if fmt == "json":
@@ -602,10 +651,10 @@ def cat(ctx, file_path, repo, lines, symbol, fmt):
 
         try:
             with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
-                match = resolve_symbol(symbol, repo_cfg.name, rel, store)
+                match = resolve_symbol(symbol, repo_cfg.name, rel, store, profile=cfg.embedding.profile_name)
 
                 if not match:
-                    suggestions = get_symbol_suggestions(repo_cfg.name, rel, store)
+                    suggestions = get_symbol_suggestions(repo_cfg.name, rel, store, profile=cfg.embedding.profile_name)
                     click.echo(f"Symbol '{symbol}' not found in {rel}.", err=True)
                     if suggestions:
                         click.echo(f"  Available symbols: {', '.join(suggestions)}", err=True)
@@ -725,6 +774,7 @@ def history(ctx, query, since, repo, limit, symbol, fmt):
                 repo_filter=repo,
                 symbol_filter=symbol,
                 embedding_backend=backend,
+                profile=cfg.embedding.profile_name,
             )
     except StoreError as e:
         click.echo(f"Error: {e}", err=True)
@@ -759,28 +809,33 @@ def status(ctx):
     from flowmap.state import StateDB
     from flowmap.store import VectorStore
 
+    profile = cfg.embedding.profile_name
     with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
-        stats = store.get_stats(known_repos=[r.name for r in cfg.repos])
-        click.echo(f"Index: {stats['total']} total chunks\n")
+        stats = store.get_stats(profile=profile, known_repos=[r.name for r in cfg.repos])
+        other = [p for p in store.list_profiles() if p != profile]
+        header = f"Index [profile: {profile}]: {stats['total']} total chunks"
+        if other:
+            header += f"   (other profiles: {', '.join(sorted(other))})"
+        click.echo(header + "\n")
 
         for repo in cfg.repos:
-            info = state.get_repo(repo.name)
             path_exists = repo.resolved_path().is_dir()
+            idx = state.get_repo_index(repo.name, profile)
+            sha_val = idx["sha"]
+            branch_val = idx["branch"]
+            when = (idx["indexed_at"] or "")[:10]
 
             if not path_exists:
                 marker = click.style("!", fg="red")
                 click.echo(f"  {marker} {repo.name:<28} path missing: {repo.path}")
-            elif info and info.get("last_indexed_at"):
+            elif sha_val:
                 marker = click.style("✓", fg="green")
                 chunks = stats.get("repos", {}).get(repo.name, 0)
-                sha = (info.get("last_indexed_sha") or "")[:7]
-                branch = info.get("last_indexed_branch") or ""
-                when = info["last_indexed_at"][:10]
-                branch_str = f"{branch}, " if branch else ""
-                click.echo(f"  {marker} {repo.name:<28} {chunks:>6} chunks  {when}  ({branch_str}{sha})")
+                branch_str = f"{branch_val}, " if branch_val else ""
+                click.echo(f"  {marker} {repo.name:<28} {chunks:>6} chunks  {when}  ({branch_str}{sha_val[:7]})")
             else:
                 marker = click.style("✗", fg="yellow")
-                click.echo(f"  {marker} {repo.name:<28} not indexed")
+                click.echo(f"  {marker} {repo.name:<28} not indexed (profile: {profile})")
 
 
 # ---------------------------------------------------------------------------
@@ -802,19 +857,28 @@ def reset(ctx, repo, reset_all, benchmarks):
 
     with StateDB(cfg.db_path) as state, VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
         if benchmarks:
+            # Only drop on-disk profiles that are NOT in config — true throwaway
+            # benchmark tables. Never delete a configured profile or default.
+            configured = set(cfg.embedding.profiles) | {"default"}
             for profile in store.list_profiles():
-                if profile != "default":
+                if profile not in configured:
                     store.drop_table(profile)
+                    state.clear_profile_staleness(profile)
                     click.echo(f"Dropped benchmark profile: {profile}")
         elif repo:
-            store.delete_by_repo(repo)
-            state.delete_repo(repo)
+            # Purge the repo from every profile table + clear all its staleness.
+            for prof in store.list_profiles():
+                store.delete_by_repo(repo, profile=prof)
+            state.delete_repo(repo)  # atomic: repos row + per-profile staleness
             click.echo(f"Reset: {repo}")
         elif reset_all:
             for profile in store.list_profiles():
                 store.drop_table(profile)
             for r in state.list_repos():
                 state.delete_repo(r["name"])
+            # Belt-and-suspenders: clear any orphaned staleness for repos already
+            # gone from the repos table (the exact pre-fix bug class).
+            state.clear_all_staleness()
             click.echo("Reset: all index data deleted.")
         else:
             click.echo("Specify --repo, --all, or --benchmarks.", err=True)
@@ -870,31 +934,32 @@ def doctor(ctx):
     else:
         click.echo(f"  {click.style('MISSING', fg='yellow')}  ripgrep (rg) not installed — keyword search disabled")
 
-    # 4. Check index state
-    click.echo("\nIndex:")
+    # 4. Check index state (for the active profile)
+    profile = cfg.embedding.profile_name
+    click.echo(f"\nIndex [profile: {profile}]:")
     from flowmap.state import StateDB
     from flowmap.store import VectorStore
     try:
         with StateDB(cfg.db_path) as state:
-            stored_model = state.get_meta("embedding_model")
-            stored_dims = state.get_meta("embedding_dims")
+            stored_model = state.get_meta("embedding_model", profile)
+            stored_dims = state.get_meta("embedding_dims", profile)
             if stored_model:
                 click.echo(f"  Model: {stored_model} ({stored_dims or '?'} dims)")
                 if stored_dims and backend_dims and int(stored_dims) != backend_dims:
                     click.echo(f"  {click.style('WARN', fg='yellow')}  Dimension mismatch: stored={stored_dims}, current={backend_dims}. Run: flowmap index --full")
                     ok = False
             else:
-                click.echo(f"  {click.style('EMPTY', fg='yellow')}  No index data. Run: flowmap index")
+                click.echo(f"  {click.style('EMPTY', fg='yellow')}  No index data for profile '{profile}'. Run: flowmap index")
                 ok = False
 
             # Check for pending markers
             for repo in cfg.repos:
-                pending = state.get_meta(f"pending:{repo.name}")
+                pending = state.get_meta(f"pending:{repo.name}", profile)
                 if pending:
                     click.echo(f"  {click.style('WARN', fg='yellow')}  {repo.name}: interrupted index detected (will re-index on next run)")
 
         with VectorStore(cfg.lancedb_path, vector_dims=_get_stored_dims(cfg)) as store:
-            stats = store.get_stats(known_repos=[r.name for r in cfg.repos])
+            stats = store.get_stats(profile=profile, known_repos=[r.name for r in cfg.repos])
             click.echo(f"  Total chunks: {stats['total']}")
             for rname, count in stats.get("repos", {}).items():
                 click.echo(f"    {rname}: {count} chunks")

@@ -140,6 +140,7 @@ def compute_incremental(
     embedding_backend,
     state_db,
     on_progress=None,
+    profile: str = "default",
 ) -> IncrementalResult:
     """Run incremental reindex: only re-embed changed files.
 
@@ -164,7 +165,7 @@ def compute_incremental(
         on_progress(f"{len(added)} added, {len(modified)} modified, {len(deleted)} deleted, {len(renamed)} renamed")
 
     # Set pending marker before mutations — crash recovery
-    state_db.set_meta(f"pending:{repo_name}", current.sha)
+    state_db.set_meta(f"pending:{repo_name}", current.sha, profile)
 
     # Step 1: Chunk and embed FIRST (failure-prone step — no store mutations yet)
     # If embedding fails here, no data has been deleted.
@@ -183,43 +184,52 @@ def compute_incremental(
     # This closes the data-loss window: if we crash after upsert but before
     # cleanup, we have stale+new data (no loss). Pending marker handles recovery.
     if chunks and all_embeddings:
-        store.upsert_chunks(chunks, all_embeddings)
+        store.upsert_chunks(chunks, all_embeddings, profile=profile)
         total_chunks = len(chunks)
 
     # Step 3: Clean up stale data (safe — upsert already succeeded)
     # Deleted files: remove all chunks (no new data exists for these)
     for c in deleted:
-        store.delete_by_file(repo_name, c.path)
+        store.delete_by_file(repo_name, c.path, profile=profile)
     # Renamed files: remove old path (new path was upserted in step 2)
     for c in renamed:
         if c.old_path:
-            store.delete_by_file(repo_name, c.old_path)
+            store.delete_by_file(repo_name, c.old_path, profile=profile)
     # Modified files: remove only stale chunk IDs (symbols removed or reordered)
     # Can't use delete_by_file — it would delete the just-upserted chunks too.
     new_ids_by_file: dict[str, set[str]] = {}
     for chunk in chunks:
         new_ids_by_file.setdefault(chunk["file"], set()).add(chunk["id"])
+    cleanup_ok = True
     for c in modified:
         valid_ids = new_ids_by_file.get(c.path, set())
-        store.delete_stale_chunks(repo_name, c.path, valid_ids)
+        if not store.delete_stale_chunks(repo_name, c.path, valid_ids, profile=profile):
+            cleanup_ok = False
 
     # Get actual total chunk count from the store (not just the delta)
     actual_count = total_chunks
     try:
-        stats = store.get_stats(known_repos=[repo_name])
+        stats = store.get_stats(profile=profile, known_repos=[repo_name])
         actual_count = stats["repos"].get(repo_name, total_chunks)
     except Exception:
         pass  # fall back to delta count if stats query fails
 
-    # Update state
-    state_db.update_repo_indexed(
-        name=repo_name,
-        sha=current.sha,
-        branch=current.branch,
-        chunk_count=actual_count,
-    )
-    # Clear pending marker after successful state update
-    state_db.set_meta(f"pending:{repo_name}", "")
+    # Update state: per-profile staleness always; global repos mirror only for the
+    # legacy default profile (avoids cross-profile last-writer-wins poisoning).
+    state_db.set_repo_index(repo_name, sha=current.sha, branch=current.branch,
+                            chunks=actual_count, profile=profile)
+    if profile == "default":
+        state_db.update_repo_indexed(
+            name=repo_name,
+            sha=current.sha,
+            branch=current.branch,
+            chunk_count=actual_count,
+        )
+    # Clear the pending marker only if stale cleanup fully succeeded. If it failed
+    # or was capped, orphaned chunks may remain — keep the marker set so the next
+    # run forces a clean full reindex instead of silently trusting a partial state.
+    if cleanup_ok:
+        state_db.set_meta(f"pending:{repo_name}", "", profile)
 
     return IncrementalResult(
         mode="incremental",
