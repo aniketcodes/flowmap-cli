@@ -2,7 +2,7 @@
 
 **Cross-repo code intelligence CLI for LLMs.**
 
-FlowMap indexes your codebases with tree-sitter AST parsing, stores them in a local vector database, and gives you fast hybrid search (semantic + keyword + symbol) across all your repos. Built for developers who use LLMs for code navigation and want better context than `grep`.
+FlowMap indexes your codebases with tree-sitter AST parsing, stores them in a local vector database, and gives you fast hybrid search (semantic + BM25 full-text + keyword + symbol) across all your repos. Built for developers who use LLMs for code navigation and want better context than `grep`.
 
 ### Why?
 
@@ -27,20 +27,24 @@ One query. Three repos. Three languages. Ranked by relevance. That's the point.
 ## What it does
 
 - **Indexes your repos** with tree-sitter, extracting functions, classes, methods, and their signatures
-- **Hybrid search** fuses 3 channels: ripgrep (keyword), vector similarity (semantic), and symbol lookup (exact match) using Reciprocal Rank Fusion
+- **Hybrid search** fuses 4 channels: ripgrep (live keyword), BM25/FTS (ranked full-text), vector similarity (semantic), and symbol lookup (exact match) using Reciprocal Rank Fusion
 - **Incremental reindexing** via `git diff` -- only re-embeds changed files
 - **Structural history** shows AST-level diffs (function added/removed/signature changed) over time
 - **Works across repos** -- search one query, get results from all your projects
 
 ## Languages with AST support
 
-Full tree-sitter parsing (functions, classes, methods, signatures):
+Full AST parsing (functions, classes, methods, signatures):
 
-**Python** | **TypeScript** | **JavaScript** | **TSX/JSX** | **Go** | **Java** | **YAML** | **JSON**
+**Python** | **TypeScript** | **JavaScript** | **TSX/JSX** | **Go** | **Java** | **Swift**
 
-These languages get line-based fallback chunking (indexed but no symbol extraction):
+Structural parsing of top-level keys:
 
-Rust | C | C++ | Kotlin | Ruby | PHP | C# | Swift | SQL | GraphQL | Protobuf | Terraform | Shell | Markdown
+**YAML** | **JSON**
+
+These get line-based fallback chunking (indexed, but no symbol extraction):
+
+Rust | C | C++ | Kotlin | Ruby | PHP | C# | SQL | GraphQL | Protobuf | Terraform | Shell | Markdown
 
 ---
 
@@ -49,28 +53,22 @@ Rust | C | C++ | Kotlin | Ruby | PHP | C# | Swift | SQL | GraphQL | Protobuf | T
 ### 1. Install
 
 ```bash
-git clone https://github.com/aniket-agi/flowmap-cli.git
+git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
-uv sync
+uv tool install .
 ```
+
+This installs a global `flowmap` command in its own isolated environment — no PATH editing or shell-rc changes.
 
 > Don't have uv? Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+>
+> Requires Python 3.11+ — uv provisions it automatically.
+>
+> If `flowmap` isn't found afterward, run `uv tool update-shell` once and reopen your terminal.
+>
+> Prefer not to install globally? Run `uv sync` and prefix commands with `uv run` (e.g. `uv run flowmap --help`) from the repo.
 
-### 2. Add to your PATH
-
-Add this to your `~/.zshrc` (or `~/.bashrc`):
-
-```bash
-export PATH="/path/to/flowmap-cli/.venv/bin:$PATH"
-```
-
-Then reload:
-
-```bash
-source ~/.zshrc
-```
-
-Verify it works:
+### 2. Verify
 
 ```bash
 flowmap --help
@@ -81,13 +79,15 @@ flowmap --help
 FlowMap uses [Ollama](https://ollama.com) for embeddings by default. It's free, runs locally, and needs no API keys.
 
 ```bash
-# Install Ollama (macOS)
-brew install ollama
+# Install Ollama
+brew install ollama                              # macOS
+# Linux:   curl -fsSL https://ollama.com/install.sh | sh
+# Windows: download the installer from https://ollama.com/download
 
 # Start the server
 ollama serve
 
-# Pull the embedding model (~400MB download, one-time)
+# Pull the embedding model (~640MB download, one-time)
 ollama pull qwen3-embedding:0.6b
 ```
 
@@ -233,7 +233,7 @@ Keyword mode uses ripgrep directly. No embeddings, no Ollama, instant results.
 ```
 flowmap index                    # Build/update the index (incremental)
 flowmap index --full             # Force full rebuild
-flowmap search "query"           # Hybrid search (semantic + keyword + symbol)
+flowmap search "query"           # Hybrid search (semantic + BM25 + keyword + symbol)
 flowmap search "fn" --mode symbol  # Find by function/class name
 flowmap search "x" --mode keyword  # Grep-style (no Ollama needed)
 flowmap map                      # Show repo structure
@@ -258,7 +258,7 @@ flowmap reset --all              # Delete all index data
 The main command. Searches across all indexed repos.
 
 ```bash
-# Default: hybrid search (semantic + keyword + symbol fusion)
+# Default: hybrid search (semantic + BM25 + keyword + symbol fusion)
 flowmap search "database connection pooling"
 
 # Semantic only (vector similarity)
@@ -285,7 +285,7 @@ flowmap search "complex query" --rerank
 
 | Mode               | What it does                                   | Speed | Needs Ollama? |
 | ------------------ | ---------------------------------------------- | ----- | ------------- |
-| `hybrid` (default) | Fuses ripgrep + vector + symbol search via RRF | ~1-2s | Yes           |
+| `hybrid` (default) | Fuses ripgrep + BM25/FTS + vector + symbol via RRF | ~1-2s | Yes           |
 | `semantic`         | Vector similarity only                         | ~0.5s | Yes           |
 | `keyword`          | ripgrep only (live filesystem grep)            | ~0.1s | No            |
 | `symbol`           | Exact/suffix/contains match on symbol names    | ~0.1s | No            |
@@ -501,6 +501,9 @@ embedding:
 Local Python-based embeddings. No external server needed, but requires PyTorch.
 
 ```bash
+# If you installed with `uv tool install .`:
+uv tool install ".[local-embeddings]"
+# Or, in a cloned repo:
 uv sync --extra local-embeddings
 ```
 
@@ -532,7 +535,7 @@ Your repos                FlowMap                    Search
                           local storage, no cloud
                               |
                               v
-                         3-way hybrid search  <---  "your query"
+                         4-way hybrid search  <---  "your query"
                           ripgrep + vector + symbol
                               |
                               v
@@ -643,7 +646,7 @@ curl http://localhost:11434/api/tags
 
 ```bash
 # Clone
-git clone https://github.com/aniket-agi/flowmap-cli.git
+git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
 
 # Install with dev dependencies
@@ -658,7 +661,7 @@ uv run ruff check flowmap/
 
 ### Test suite
 
-291 tests covering:
+424 tests covering:
 
 - Tree-sitter chunking (Python, TypeScript, Go, Java, YAML, JSON)
 - LanceDB store operations (real database, not mocked)
@@ -727,7 +730,7 @@ Contributions are welcome. Here's how to get started:
 ### Setup
 
 ```bash
-git clone https://github.com/aniket-agi/flowmap-cli.git
+git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
 uv sync --extra dev
 ```
@@ -738,7 +741,7 @@ uv sync --extra dev
 uv run pytest tests/ -v
 ```
 
-All 291 tests should pass. If they don't, your environment has an issue -- fix that first.
+All 424 tests should pass. If they don't, your environment has an issue -- fix that first.
 
 ### Making changes
 
@@ -779,7 +782,7 @@ flowmap/
     chunker.py            # Tree-sitter AST chunking
     languages.py          # Grammar registry
   search/
-    hybrid.py             # 3-way fusion + RRF + reranking
+    hybrid.py             # 4-way fusion + RRF + reranking
     ripgrep.py            # ripgrep subprocess wrapper
   services/
     indexing.py            # Index orchestration (full + incremental)
@@ -792,13 +795,13 @@ flowmap/
     git_ops.py             # Git log, show, pickaxe wrappers
 tests/
   conftest.py              # Shared fixtures (MockBackend, hash_vector)
-  test_chunker.py          # 49 tests -- AST parsing for all languages
-  test_store_integration.py # 26 tests -- real LanceDB operations
-  test_cli_commands.py     # 20 tests -- all CLI commands
-  test_end_to_end.py       # 6 tests -- full index->search pipeline
+  test_chunker.py          # 77 tests -- AST parsing for all languages
+  test_store_integration.py # 43 tests -- real LanceDB operations
+  test_cli_commands.py     # 33 tests -- all CLI commands
+  test_end_to_end.py       # 10 tests -- full index->search pipeline
   test_reindex.py          # 18 tests -- incremental reindex + ordering
-  test_history.py          # 19 tests -- git ops + structural diff
-  ...and more
+  test_history.py          # 24 tests -- git ops + structural diff
+  ...and more (424 total)
 ```
 
 ---
@@ -807,7 +810,7 @@ tests/
 
 - **Large repos (>50K files):** Memory usage scales with repo size. The entire chunk + embedding set is held in memory during indexing. For very large monorepos, ensure adequate RAM.
 - **Windows:** Best-effort support. The advisory file lock behavior differs from Unix. Primary development and testing is on macOS/Linux.
-- **AST coverage:** Only Python, TypeScript, JavaScript, Go, Java, YAML, and JSON have full tree-sitter grammars. Other languages fall back to line-based chunking (still indexed, but no symbol extraction).
+- **AST coverage:** Only Python, TypeScript, JavaScript, Go, Java, Swift, YAML, and JSON have full tree-sitter grammars. Other languages fall back to line-based chunking (still indexed, but no symbol extraction).
 - **Concurrent access:** Designed for single-user CLI use. Don't run `flowmap index` from multiple terminals simultaneously. Search during indexing may return partial results.
 
 ---
@@ -831,7 +834,7 @@ flowmap doctor        # Full health check
 ### How to use FlowMap for code search
 
 ```bash
-# Find code by meaning (semantic + keyword + symbol fusion)
+# Find code by meaning (semantic + BM25 + keyword + symbol fusion)
 flowmap search "authentication middleware" --format json
 
 # Find a specific function or class by name

@@ -267,7 +267,7 @@ def _config_from_env() -> FlowmapConfig:
 
 DEFAULT_CONFIG_TEMPLATE = """\
 # FlowMap configuration
-# Docs: https://github.com/aniket-agi/flowmap-cli
+# Docs: https://github.com/aniketcodes/flowmap-cli
 
 repos:
   # - name: my-service
