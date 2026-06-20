@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from flowmap.config import RepoConfig
 from flowmap.services.file_resolver import ResolvedFile, resolve_file
 from flowmap.services.symbol_lookup import SymbolMatch, resolve_symbol, get_symbol_suggestions
-from flowmap.services.indexing import IndexResult, embed_chunks
+from flowmap.services.indexing import IndexResult, embed_chunks, index_changed_content
 from flowmap.store import SearchResult
 
 
@@ -18,6 +18,39 @@ from flowmap.store import SearchResult
 
 def _make_repo(name: str, path: str) -> RepoConfig:
     return RepoConfig(name=name, path=path)
+
+
+class TestIndexChangedContent:
+    """The FTS index rebuild (O(corpus)) should only run when indexing actually
+    touched the `text` corpus — not after a no-op incremental / 'up to date' run."""
+
+    def test_skipped_only_means_no_change(self):
+        results = [IndexResult("r1", "skipped", 0, "up to date"),
+                   IndexResult("r2", "skipped", 0, "up to date")]
+        assert index_changed_content(results) is False
+
+    def test_full_means_changed(self):
+        results = [IndexResult("r1", "skipped", 0, "up to date"),
+                   IndexResult("r2", "full", 42, "42 chunks indexed")]
+        assert index_changed_content(results) is True
+
+    def test_incremental_means_changed(self):
+        results = [IndexResult("r1", "incremental", 10, "+1 -0 ~2")]
+        assert index_changed_content(results) is True
+
+    def test_deletion_to_zero_still_counts_as_changed(self):
+        # Incremental that removed the last chunk: total_chunks=0 but content DID
+        # change → FTS must rebuild to drop the stale rows. A chunks-based guard
+        # would wrongly skip; mode-based catches it.
+        results = [IndexResult("r1", "incremental", 0, "+0 -3 ~0")]
+        assert index_changed_content(results) is True
+
+    def test_error_does_not_count_as_changed(self):
+        results = [IndexResult("r1", "error", 0, "path not found")]
+        assert index_changed_content(results) is False
+
+    def test_empty_results(self):
+        assert index_changed_content([]) is False
 
 
 def _make_search_result(

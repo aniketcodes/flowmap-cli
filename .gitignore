@@ -37,3 +37,5 @@ htmlcov/
 
 # JetBrains (optional; remove if you commit shared IDE config)
 .idea/
+
+eval/

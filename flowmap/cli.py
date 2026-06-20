@@ -306,7 +306,7 @@ def index(ctx, repo, full, dry_run):
         return
 
     from flowmap.embeddings import create_backend
-    from flowmap.services.indexing import run_index
+    from flowmap.services.indexing import index_changed_content, run_index
     from flowmap.state import StateDB
     from flowmap.store import VectorStore
 
@@ -350,7 +350,7 @@ def index(ctx, repo, full, dry_run):
                     )
                     sys.exit(1)
 
-            run_index(
+            results = run_index(
                 store=store,
                 state=state,
                 backend=backend,
@@ -360,11 +360,24 @@ def index(ctx, repo, full, dry_run):
                 profile=profile,
             )
 
-            # Rebuild FTS and vector indexes once after all repos
-            click.echo("Rebuilding search indexes...")
-            store.rebuild_fts_index(profile)
-            store.rebuild_vector_index(profile)
-            store.compact(profile)
+            # Rebuild only when the corpus changed (the O(corpus) rebuild has no
+            # partial update) — OR when the on-disk FTS index predates the current
+            # schema, a one-time forced migration so stale profiles don't keep a
+            # positionless index that silently returns [] for phrase queries.
+            from flowmap.store import FTS_INDEX_VERSION
+            fts_outdated = state.get_meta("fts_index_version", profile) != FTS_INDEX_VERSION
+            if index_changed_content(results) or fts_outdated:
+                if index_changed_content(results):
+                    click.echo("Rebuilding search indexes...")
+                else:
+                    click.echo("Upgrading search index to current schema...")
+                built_version = store.rebuild_fts_index(profile)
+                store.rebuild_vector_index(profile)
+                store.compact(profile)
+                # Stamp what was actually built (not the constant): a "1" fallback
+                # or None build leaves the profile outdated to re-try next run.
+                if built_version is not None:
+                    state.set_meta("fts_index_version", built_version, profile)
             click.echo("Done.")
     finally:
         _release_index_lock(lock_fd)

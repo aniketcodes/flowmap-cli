@@ -23,6 +23,18 @@ class IndexResult:
     message: str
 
 
+def index_changed_content(results: list[IndexResult]) -> bool:
+    """Did this index run actually touch the `text` corpus?
+
+    True only for "full"/"incremental" runs (content added/modified/deleted).
+    "skipped" (up to date / no-op incremental) and "error" leave the corpus
+    untouched. Used to gate the O(corpus) FTS rebuild so a no-op `index` run
+    doesn't pay for a full rebuild. Note: LanceDB FTS has no partial update, so
+    any real change still triggers a full rebuild — that part is inherent.
+    """
+    return any(r.mode in ("full", "incremental") for r in results)
+
+
 def embed_chunks(
     chunks: list[dict],
     backend,

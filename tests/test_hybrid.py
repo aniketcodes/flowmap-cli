@@ -5,6 +5,18 @@ from flowmap.search.hybrid import hybrid_search, HybridResult, classify_query
 from flowmap.store import SearchResult
 
 
+def test_weights_grid_shape():
+    """Every query type must weight exactly the four legs (ripgrep/symbol/
+    semantic/fts) with numeric weights. Guards against a mistyped key silently
+    dropping a leg from RRF fusion for one query class."""
+    from flowmap.search.hybrid import _WEIGHTS
+    expected_keys = {"ripgrep", "symbol", "semantic", "fts"}
+    assert set(_WEIGHTS) == {"identifier", "mixed", "natural_language"}
+    for qtype, w in _WEIGHTS.items():
+        assert set(w) == expected_keys, qtype
+        assert all(isinstance(v, (int, float)) for v in w.values()), qtype
+
+
 def _mock_search_result(repo="r", file="f.py", start_line=10, end_line=20, symbol="foo", score=0.8):
     return SearchResult(
         repo=repo, file=file, start_line=start_line, end_line=end_line,
@@ -21,10 +33,11 @@ def _make_mock_backend():
     return backend
 
 
-def _make_mock_store(semantic_results=None, symbol_results=None, chunk_for_line=None):
+def _make_mock_store(semantic_results=None, symbol_results=None, chunk_for_line=None, fts_results=None):
     store = MagicMock()
     store.search_vector.return_value = semantic_results or []
     store.search_symbol.return_value = symbol_results or []
+    store.search_fts.return_value = fts_results or []
     store.find_chunk_containing.return_value = chunk_for_line
     # For batch ripgrep-to-chunk mapping: return the chunk in a list if provided
     if chunk_for_line:
@@ -269,6 +282,88 @@ def test_limit_respected(mock_rg):
     )
 
     assert len(results) <= 5
+
+
+# ---------------------------------------------------------------------------
+# BM25 / FTS leg
+# ---------------------------------------------------------------------------
+
+@patch("flowmap.search.hybrid.rg_search", return_value=[])
+def test_hybrid_runs_fts_search(mock_rg):
+    """Hybrid should query the FTS/BM25 leg as a 4th source."""
+    backend = _make_mock_backend()
+    store = _make_mock_store(semantic_results=[_mock_search_result()])
+
+    hybrid_search(
+        query="how does auth work",
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        reranking_enabled=False,
+    )
+
+    store.search_fts.assert_called_once()
+
+
+@patch("flowmap.search.hybrid.rg_search", return_value=[])
+def test_fts_recovers_result_other_legs_miss(mock_rg):
+    """A chunk found ONLY by BM25/FTS (not semantic/symbol/ripgrep) must surface,
+    tagged with the 'fts' source. This is the complementarity that justifies the leg."""
+    backend = _make_mock_backend()
+    fts_hit = _mock_search_result(file="otp.py", symbol="verifyOtp", score=5.0)
+    store = _make_mock_store(semantic_results=[], fts_results=[fts_hit])
+
+    results = hybrid_search(
+        query="otp login authentication",
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        reranking_enabled=False,
+    )
+
+    assert any(r.symbol_name == "verifyOtp" for r in results)
+    hit = next(r for r in results if r.symbol_name == "verifyOtp")
+    assert "fts" in hit.sources
+
+
+@patch("flowmap.search.hybrid.rg_search", return_value=[])
+def test_hybrid_forwards_profile_to_fts(mock_rg):
+    """A non-default profile must reach the FTS leg so the right table is queried."""
+    backend = _make_mock_backend()
+    store = _make_mock_store(fts_results=[_mock_search_result()])
+
+    hybrid_search(
+        query="how does auth work",
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        reranking_enabled=False,
+        profile="qwen4b",
+    )
+
+    assert store.search_fts.call_args.kwargs.get("profile") == "qwen4b"
+
+
+@patch("flowmap.search.hybrid.rg_search", return_value=[])
+def test_degradation_fts_crashes(mock_rg):
+    """If the FTS leg raises (e.g. index missing), hybrid still returns other results."""
+    backend = _make_mock_backend()
+    store = _make_mock_store(semantic_results=[_mock_search_result()])
+    store.search_fts.side_effect = Exception("fts index missing")
+
+    results = hybrid_search(
+        query="test",
+        repo_paths={"r": "/tmp/r"},
+        embedding_backend=backend,
+        store=store,
+        limit=5,
+        reranking_enabled=False,
+    )
+
+    assert len(results) >= 1
 
 
 # ---------------------------------------------------------------------------

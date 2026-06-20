@@ -112,6 +112,21 @@ def _escape_like(value: str) -> str:
     return _escape_sql(value).replace("%", "\\%").replace("_", "\\_")
 
 
+def _fts_score(row: dict) -> float:
+    """BM25 score from an FTS row (`_score`, older builds `score`). Explicit
+    None checks, not `a or b` — a real 0.0 score is falsy and must survive."""
+    s = row.get("_score")
+    if s is None:
+        s = row.get("score")
+    return float(s) if s is not None else 0.0
+
+
+# FTS index schema version. Bump when rebuild_fts_index changes how the index is
+# built so existing profiles get a one-time forced rebuild (see cli.index).
+#   1 = legacy, no token positions
+#   2 = with_position=True (enables quoted phrase queries)
+FTS_INDEX_VERSION = "2"
+
 
 class VectorStore:
     """LanceDB-backed vector store with profile-scoped tables."""
@@ -199,16 +214,36 @@ class VectorStore:
             except Exception as e:
                 log.debug("Scalar index on %s already exists or failed: %s", col, e)
 
-    def rebuild_fts_index(self, profile: str = "default"):
-        """Rebuild the full-text search index. Call after all upserts are done, not per-repo."""
+    def rebuild_fts_index(self, profile: str = "default") -> str | None:
+        """Rebuild the FTS index. Call once after all upserts, not per-repo.
+
+        Returns the schema version actually built, so the caller stamps what was
+        achieved, not attempted:
+          - "2" (FTS_INDEX_VERSION): positioned index built
+          - "1": positionless fallback (older LanceDB)
+          - None: nothing built (absent table or build failed)
+        """
         name = self._table_name(profile)
         if name not in self._list_table_names():
-            return
+            return None
         table = self._db.open_table(name)
         try:
-            table.create_fts_index("text", replace=True)
+            # with_position=True stores token positions so quoted phrase queries
+            # ("connection pool") work instead of raising "position is not found".
+            table.create_fts_index("text", replace=True, with_position=True)
+            return FTS_INDEX_VERSION
+        except TypeError:
+            # Older LanceDB without with_position — fall back to a positionless
+            # index and report "1" so the migration re-fires after a LanceDB upgrade.
+            try:
+                table.create_fts_index("text", replace=True)
+                return "1"
+            except Exception as e:
+                log.debug("FTS index rebuild (positionless fallback) failed: %s", e)
+                return None
         except Exception as e:
             log.debug("FTS index rebuild skipped: %s", e)
+            return None
 
     def rebuild_vector_index(self, profile: str = "default"):
         """Rebuild the IVF-PQ vector index. Call after all upserts are done.
@@ -409,6 +444,56 @@ class VectorStore:
             raise
         except Exception as e:
             raise StoreError(f"Vector search failed: {e}") from e
+
+    def search_fts(
+        self,
+        query: str,
+        limit: int = 10,
+        repo_filter: str | None = None,
+        profile: str = "default",
+    ) -> list[SearchResult]:
+        """Full-text BM25 search via the LanceDB FTS index on the `text` column.
+
+        Returns results scored by BM25 relevance (higher = better). Best-effort,
+        like the ripgrep leg: degrades to an empty list if the table or its FTS
+        index is absent, or the query is rejected by the FTS parser.
+        """
+        if not query or not query.strip():
+            return []
+        name = self._table_name(profile)
+        if name not in self._list_table_names():
+            return []
+        table = self._db.open_table(name)
+        # Best-effort: does this table actually carry an FTS index on `text`?
+        # Lets us tell "not built yet" (debug) from "built but broken" (warning),
+        # so a silently-degraded BM25 leg is visible rather than indistinguishable
+        # from an un-rebuilt profile. Wrapped — detection must never break search.
+        has_fts: bool | None = None
+        try:
+            has_fts = any(
+                "text" in (getattr(ix, "columns", None) or [])
+                and "fts" in str(getattr(ix, "index_type", "")).lower()
+                for ix in table.list_indices()
+            )
+        except Exception:
+            pass
+        try:
+            q = table.search(query, query_type="fts").limit(limit)
+            if repo_filter:
+                q = q.where(f"repo = '{_escape_sql(repo_filter)}'")
+            out: list[SearchResult] = []
+            for r in q.to_list():
+                sr = self._row_to_result(r)
+                sr.score = _fts_score(r)
+                out.append(sr)
+            return out
+        except Exception as e:
+            # This leg is optional, so degrade gracefully rather than fail search.
+            if has_fts:
+                log.warning("FTS search failed on existing index for %s: %s", name, e)
+            else:
+                log.debug("FTS search unavailable (index absent?) for %s: %s", name, e)
+            return []
 
     def search_symbol(
         self,
