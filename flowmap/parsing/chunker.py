@@ -116,11 +116,87 @@ def chunk_file(filepath: str, content: str, extension: str) -> list[Chunk]:
     parser, strategy = get_parser(extension)
 
     if strategy == "code" and parser is not None:
-        return _chunk_code(content, language, parser)
+        chunks = _chunk_code(content, language, parser)
     elif strategy == "config" and parser is not None:
-        return _chunk_config(content, language, parser)
+        chunks = _chunk_config(content, language, parser)
     else:
-        return _chunk_fallback(content, language)
+        chunks = _chunk_fallback(content, language)
+
+    return _enforce_size_cap(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Size-cap enforcement (final pass)
+# ---------------------------------------------------------------------------
+
+
+def _enforce_size_cap(chunks: list[Chunk]) -> list[Chunk]:
+    """Hard-split any chunk over MAX_CHUNK_CHARS into line-windowed parts.
+
+    The AST splitters only cap `class`/`preamble` chunks; an oversized
+    `function` or a minified one-line file would otherwise reach the embedder
+    over-context. Sub-chunks keep the parent metadata and get distinct ids from
+    the indexer's per-file position.
+    """
+    out: list[Chunk] = []
+    for c in chunks:
+        if len(c.text) <= MAX_CHUNK_CHARS:
+            out.append(c)
+        else:
+            out.extend(_hard_split_chunk(c))
+    return out
+
+
+def _hard_split_chunk(chunk: Chunk) -> list[Chunk]:
+    """Split one oversized chunk into <= MAX_CHUNK_CHARS parts."""
+    parts: list[Chunk] = []
+    for seg_text, line_offset in _split_text_to_cap(chunk.text):
+        if not seg_text.strip():
+            continue
+        start = chunk.start_line + line_offset
+        parts.append(Chunk(
+            text=seg_text,
+            chunk_type=chunk.chunk_type,
+            symbol_name=chunk.symbol_name,
+            signature=chunk.signature,
+            parent_symbol=chunk.parent_symbol,
+            parent_signature=chunk.parent_signature,
+            start_line=start,
+            end_line=start + seg_text.count("\n"),
+            language=chunk.language,
+        ))
+    # Empty parts => all-whitespace chunk; drop it. Must not fall back to
+    # `return parts or [chunk]` — re-emitting the original would breach the cap.
+    return parts
+
+
+def _split_text_to_cap(text: str) -> list[tuple[str, int]]:
+    """Split text into (segment, line_offset) pairs each <= MAX_CHUNK_CHARS,
+    breaking on lines; a single over-cap line is sliced on char boundaries."""
+    lines = text.splitlines(keepends=True)
+    segments: list[tuple[str, int]] = []
+    buf: list[str] = []
+    buf_len = 0
+    buf_start = 0
+    for line_no, line in enumerate(lines):
+        if len(line) > MAX_CHUNK_CHARS:
+            # Flush whatever is buffered, then hard-split this monster line.
+            if buf:
+                segments.append(("".join(buf), buf_start))
+                buf, buf_len = [], 0
+            for j in range(0, len(line), MAX_CHUNK_CHARS):
+                segments.append((line[j:j + MAX_CHUNK_CHARS], line_no))
+            buf_start = line_no + 1
+            continue
+        if buf and buf_len + len(line) > MAX_CHUNK_CHARS:
+            segments.append(("".join(buf), buf_start))
+            buf, buf_len = [], 0
+            buf_start = line_no
+        buf.append(line)
+        buf_len += len(line)
+    if buf:
+        segments.append(("".join(buf), buf_start))
+    return segments
 
 
 # ---------------------------------------------------------------------------

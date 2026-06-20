@@ -984,3 +984,62 @@ def test_js_cjs_signature():
     chunks = chunk_file("math.js", JS_CJS_CODE, ".js")
     area = next(c for c in chunks if c.symbol_name == "getArea")
     assert "module.exports.getArea" in area.signature
+
+
+# ---------------------------------------------------------------------------
+# Size-cap enforcement (universal oversized-chunk splitting)
+# ---------------------------------------------------------------------------
+
+from flowmap.parsing.chunker import MAX_CHUNK_CHARS
+
+
+def test_oversized_function_is_split_not_emitted_whole():
+    """A function far larger than the cap is split into parts each within it."""
+    body = "\n".join(f"    x{i} = compute({i})" for i in range(4000))
+    code = f"def huge():\n{body}\n    return x0\n"
+    assert len(code) > MAX_CHUNK_CHARS * 2  # genuinely oversized
+    chunks = chunk_file("huge.py", code, ".py")
+    assert len(chunks) >= 2
+    assert all(len(c.text) <= MAX_CHUNK_CHARS for c in chunks)
+
+
+def test_minified_single_line_is_hard_split():
+    """A minified one-line file (no newlines) is hard-split on char boundaries."""
+    one_line = "var a=" + ",".join(str(i) for i in range(60000)) + ";"
+    assert "\n" not in one_line and len(one_line) > MAX_CHUNK_CHARS
+    chunks = chunk_file("bundle.min.js", one_line, ".js")
+    assert len(chunks) >= 2
+    assert all(len(c.text) <= MAX_CHUNK_CHARS for c in chunks)
+
+
+def test_split_preserves_all_content():
+    """Splitting must not drop content — concatenating the parts' text must
+    recover every non-whitespace character of the original."""
+    body = "\n".join(f"    line_{i} = {i} * 2" for i in range(3000))
+    code = f"def big():\n{body}\n"
+    chunks = chunk_file("big.py", code, ".py")
+    joined = "".join(c.text for c in chunks)
+    assert "".join(code.split()) == "".join(joined.split())
+
+
+def test_small_chunks_untouched():
+    """The cap pass must be a no-op for normally-sized files."""
+    code = "def small():\n    return 1\n"
+    chunks = chunk_file("small.py", code, ".py")
+    assert len(chunks) == 1
+    assert chunks[0].symbol_name == "small"
+
+
+def test_all_whitespace_oversized_chunk_is_dropped_not_reemitted():
+    """An all-whitespace oversized chunk is dropped, not re-emitted. Guards
+    against a `return parts or [chunk]` fallback that would breach the cap."""
+    from flowmap.parsing.chunker import _enforce_size_cap
+
+    big_ws = Chunk(
+        text=" " * (MAX_CHUNK_CHARS * 2), chunk_type="fallback",
+        symbol_name="", signature="", parent_symbol="", parent_signature="",
+        start_line=1, end_line=1, language="python",
+    )
+    out = _enforce_size_cap([big_ws])
+    assert all(len(c.text) <= MAX_CHUNK_CHARS for c in out)
+    assert out == []

@@ -10,6 +10,23 @@ import requests
 
 log = logging.getLogger(__name__)
 
+
+def _err_detail(err: Exception | None) -> str:
+    """HTTP status + body for an embedding failure, when present."""
+    if err is None:
+        return ""
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        return f" Last response: HTTP {resp.status_code} {resp.text[:200]}"
+    return f" {type(err).__name__}: {err}"
+
+
+# batch_size lowered 32 -> 8 to dodge the Ollama 0.30.10 runner crash on large
+# embedding requests. Real fix was pinning 0.30.9; can be raised back to 32 once
+# a healthy runner is guaranteed.
+EMBED_BATCH_SIZE = 8
+EMBED_TRANSIENT_RETRIES = 3
+
 # ---------------------------------------------------------------------------
 # Model-specific prefix requirements
 # ---------------------------------------------------------------------------
@@ -139,53 +156,86 @@ class OllamaBackend:
     def model_name(self) -> str:
         return f"ollama:{self._model}"
 
-    def _embed_batch(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
-        """Embed texts in batches via Ollama /api/embed endpoint."""
+    def _embed_batch(self, texts: list[str], batch_size: int = EMBED_BATCH_SIZE) -> list[list[float]]:
+        """Embed texts via Ollama /api/embed in small sub-batches, each recovered
+        by _embed_recover so one bad input can't fail the whole run."""
         all_embeddings: list[list[float]] = []
-
         for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            last_err = None
-            for attempt in range(3):
-                try:
-                    resp = self._session.post(
-                        f"{self._url}/api/embed",
-                        json={"model": self._model, "input": batch},
-                        timeout=120,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    last_err = None
-                    break
-                except (requests.ConnectionError, requests.HTTPError) as e:
-                    last_err = e
-                    if attempt < 2:
-                        import time
-                        time.sleep(2 ** attempt)  # 1s, 2s backoff
-                        continue
-                except requests.Timeout:
-                    raise TimeoutError(
-                        f"Ollama embedding timed out after 120s (batch size: {len(batch)}). "
-                        "Try reducing batch size or check Ollama resource usage."
-                    )
-            if last_err is not None:
-                raise ConnectionError(
-                    f"Ollama connection lost after 3 retries. Is it still running at {self._url}?"
-                )
-
-            embeddings = data.get("embeddings", [])
-            if len(embeddings) != len(batch):
-                raise ValueError(
-                    f"Ollama returned {len(embeddings)} embeddings for {len(batch)} inputs"
-                )
-
-            # Cache detected dimensions
+            embeddings = self._embed_recover(texts[i:i + batch_size])
             if self._dims is None and embeddings:
                 self._dims = len(embeddings[0])
-
             all_embeddings.extend(embeddings)
-
         return all_embeddings
+
+    def _post_embed(self, batch: list[str], truncate: bool) -> list[list[float]]:
+        """One /api/embed call, embeddings 1:1 with `batch`, or raises.
+
+        truncate defaults False: truncate=True yields a prefix-only vector
+        (lossy), so it's only the last-resort backstop in _embed_recover.
+        """
+        resp = self._session.post(
+            f"{self._url}/api/embed",
+            json={"model": self._model, "input": batch, "truncate": truncate},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        embeddings = resp.json().get("embeddings", [])
+        if len(embeddings) != len(batch):
+            raise ValueError(
+                f"Ollama returned {len(embeddings)} embeddings for {len(batch)} inputs"
+            )
+        return embeddings
+
+    def _embed_recover(self, batch: list[str]) -> list[list[float]]:
+        """Embed a batch with recovery: retry, then (HTTP error) bisect to
+        isolate the bad input, then truncate a lone offender as a last resort."""
+        import time
+
+        transient_retries = EMBED_TRANSIENT_RETRIES
+        last_err: Exception | None = None
+        for attempt in range(transient_retries):
+            try:
+                return self._post_embed(batch, truncate=False)
+            except requests.Timeout:
+                raise TimeoutError(
+                    f"Ollama embedding timed out after 120s (batch size: {len(batch)}). "
+                    "Try reducing batch size or check Ollama resource usage."
+                )
+            except (requests.ConnectionError, requests.HTTPError) as e:
+                last_err = e
+                if attempt < transient_retries - 1:
+                    time.sleep(min(2 ** attempt, 8))
+
+        # A connection that survives every retry means the runner is unreachable,
+        # not that one input is bad — fail fast rather than bisect into a dead server.
+        if isinstance(last_err, requests.ConnectionError):
+            raise ConnectionError(
+                f"Ollama unreachable at {self._url} after {transient_retries} attempts "
+                f"(batch size: {len(batch)}).{_err_detail(last_err)}"
+            ) from last_err
+
+        # HTTP error survived retries (e.g. over-context input): bisect to isolate it.
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            log.warning(
+                "Embedding batch of %d failed (%s); bisecting to isolate the bad input.",
+                len(batch), _err_detail(last_err).strip(),
+            )
+            return self._embed_recover(batch[:mid]) + self._embed_recover(batch[mid:])
+
+        # Lone input still failing — truncate as a last resort (prefix-only vector).
+        try:
+            result = self._post_embed(batch, truncate=True)
+            log.warning(
+                "Embedded a single %d-char input only with truncation (prefix-only vector).",
+                len(batch[0]),
+            )
+            return result
+        except (requests.ConnectionError, requests.HTTPError, ValueError) as e:
+            raise ConnectionError(
+                f"Ollama embedding failed at {self._url} for a single input "
+                f"({len(batch[0])} chars), even with truncation.{_err_detail(e)}"
+            ) from e
 
 
 # ---------------------------------------------------------------------------

@@ -189,3 +189,70 @@ class TestEndToEnd:
         ])
         assert result2.exit_code == 0
         assert "add" in result2.output
+
+
+class TestFtsRebuildGatingAndMigration:
+    """The cli wiring around index_changed_content + FTS_INDEX_VERSION — the
+    orchestration (skip / upgrade / stamp), not just the predicate."""
+
+    def _state_version(self, config_path):
+        from flowmap.config import load_config
+        from flowmap.state import StateDB
+        cfg = load_config(config_path)
+        with StateDB(cfg.db_path) as st:
+            return st.get_meta("fts_index_version", cfg.embedding.profile_name)
+
+    def _set_state_version(self, config_path, value):
+        from flowmap.config import load_config
+        from flowmap.state import StateDB
+        cfg = load_config(config_path)
+        with StateDB(cfg.db_path) as st:
+            st.set_meta("fts_index_version", value, cfg.embedding.profile_name)
+
+    def test_full_index_stamps_current_fts_version(self, e2e_setup):
+        """A full index builds the positioned index and stamps the current version."""
+        from flowmap.store import FTS_INDEX_VERSION
+        runner = CliRunner()
+        assert _run_index(runner, e2e_setup).exit_code == 0
+        assert self._state_version(e2e_setup) == FTS_INDEX_VERSION
+
+    def test_noop_index_skips_rebuild(self, e2e_setup):
+        """A no-op incremental (nothing changed, stamp already current) must NOT
+        pay for the O(corpus) FTS rebuild — the whole point of the gate."""
+        runner = CliRunner()
+        first = _run_index(runner, e2e_setup)  # --full → builds + rebuilds
+        assert first.exit_code == 0
+        assert "Rebuilding search indexes" in first.output
+
+        with patch("flowmap.embeddings.create_backend", return_value=MockBackend()):
+            second = runner.invoke(main, ["--config", str(e2e_setup), "index"])
+        assert second.exit_code == 0
+        # Neither rebuild branch should fire on a true no-op.
+        assert "Rebuilding search indexes" not in second.output
+        assert "Upgrading search index" not in second.output
+
+    def test_stale_fts_stamp_triggers_one_time_upgrade(self, e2e_setup):
+        """An existing profile whose FTS index predates the current schema gets a
+        one-time forced rebuild even on a no-op run, and the stamp advances."""
+        from flowmap.store import FTS_INDEX_VERSION
+        runner = CliRunner()
+        assert _run_index(runner, e2e_setup).exit_code == 0
+
+        # Simulate an old positionless index from before the migration.
+        self._set_state_version(e2e_setup, "1")
+
+        with patch("flowmap.embeddings.create_backend", return_value=MockBackend()):
+            res = runner.invoke(main, ["--config", str(e2e_setup), "index"])
+        assert res.exit_code == 0
+        assert "Upgrading search index" in res.output
+        assert self._state_version(e2e_setup) == FTS_INDEX_VERSION
+
+    def test_failed_rebuild_does_not_advance_stamp(self, e2e_setup):
+        """A None-returning rebuild must NOT advance the stamp, so the migration
+        re-fires next run rather than marking a non-built index as current."""
+        runner = CliRunner()
+        with patch("flowmap.embeddings.create_backend", return_value=MockBackend()), \
+             patch("flowmap.store.VectorStore.rebuild_fts_index", return_value=None):
+            res = runner.invoke(main, ["--config", str(e2e_setup), "index", "--full"])
+        assert res.exit_code == 0
+        assert self._state_version(e2e_setup) is None  # stamp NOT advanced

@@ -1,4 +1,4 @@
-"""3-way hybrid search with RRF fusion + cross-encoder reranking."""
+"""4-way hybrid search (ripgrep + BM25/FTS + vector + symbol) with RRF fusion + cross-encoder reranking."""
 
 from __future__ import annotations
 
@@ -79,11 +79,15 @@ def classify_query(query: str) -> str:
     return "natural_language"
 
 
-# Source weights by query type
+# Source weights by query type. "fts" = BM25 leg (ranked lexical, complements
+# ripgrep's exact match). These are hand-set and un-tuned: validated only on a
+# ~31-query local set, so small deltas (fts 0.8 vs 1.0) are noise, not optima —
+# re-run a weight sweep before trusting any value. Grid shape is pinned by
+# test_weights_grid_shape.
 _WEIGHTS: dict[str, dict[str, float]] = {
-    "identifier":       {"ripgrep": 1.5, "symbol": 2.0, "semantic": 0.5},
-    "mixed":            {"ripgrep": 1.0, "symbol": 1.0, "semantic": 1.0},
-    "natural_language":  {"ripgrep": 0.5, "symbol": 0.3, "semantic": 2.0},
+    "identifier":       {"ripgrep": 1.5, "symbol": 2.0, "semantic": 0.5, "fts": 1.0},
+    "mixed":            {"ripgrep": 1.0, "symbol": 1.0, "semantic": 1.0, "fts": 1.0},
+    "natural_language":  {"ripgrep": 0.5, "symbol": 0.3, "semantic": 2.0, "fts": 0.8},
 }
 
 
@@ -162,10 +166,10 @@ def hybrid_search(
     regex: bool = False,
     profile: str = "default",
 ) -> list[HybridResult]:
-    """Run all three search methods in parallel, fuse with weighted RRF, rerank with cross-encoder.
+    """Run all four search methods in parallel, fuse with weighted RRF, rerank with cross-encoder.
 
     Pipeline:
-    1. Parallel: ripgrep (live keyword) + semantic (vector) + symbol (exact match)
+    1. Parallel: ripgrep (live keyword) + BM25/FTS (ranked lexical) + semantic (vector) + symbol (exact match)
     2. Normalize: map ripgrep lines to containing chunks (dedup BEFORE scoring)
     3. Score: weighted Reciprocal Rank Fusion
     4. Rerank: cross-encoder on top-30 candidates (if enabled)
@@ -178,8 +182,9 @@ def hybrid_search(
     rg_results: list[RgResult] = []
     semantic_results: list[SearchResult] = []
     symbol_results: list[SearchResult] = []
+    fts_results: list[SearchResult] = []
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {}
 
         futures[executor.submit(
@@ -190,6 +195,11 @@ def hybrid_search(
             query_vector = embedding_backend.embed_query(query)
             return store.search_vector(query_vector, limit=30, repo_filter=repo_filter, profile=profile)
         futures[executor.submit(_semantic)] = "semantic"
+
+        # BM25/FTS leg — runs for every query type (complements ripgrep + semantic)
+        futures[executor.submit(
+            store.search_fts, query, limit=30, repo_filter=repo_filter, profile=profile
+        )] = "fts"
 
         if query_type in ("identifier", "mixed"):
             futures[executor.submit(
@@ -207,6 +217,8 @@ def hybrid_search(
                         semantic_results = result
                     elif source == "symbol":
                         symbol_results = result
+                    elif source == "fts":
+                        fts_results = result
                 except Exception as e:
                     log.warning("Search source '%s' failed: %s", source, e)
         except TimeoutError:
@@ -256,6 +268,15 @@ def hybrid_search(
             entry = unified.setdefault(key, _UnifiedEntry.from_search_result(sr))
             entry.sources.add("symbol")
 
+    # Deduplicate FTS/BM25 results by key
+    seen_fts: set[tuple] = set()
+    for sr in fts_results:
+        key = (sr.repo, sr.file, sr.start_line)
+        if key not in seen_fts:
+            seen_fts.add(key)
+            entry = unified.setdefault(key, _UnifiedEntry.from_search_result(sr))
+            entry.sources.add("fts")
+
     for rg in rg_results:
         cache_key = (rg.repo, rg.file, rg.line)
         chunk = rg_chunk_cache[cache_key]
@@ -282,6 +303,9 @@ def hybrid_search(
         )),
         "symbol": list(dict.fromkeys(
             (sr.repo, sr.file, sr.start_line) for sr in symbol_results
+        )),
+        "fts": list(dict.fromkeys(
+            (sr.repo, sr.file, sr.start_line) for sr in fts_results
         )),
         "ripgrep": [],
     }
