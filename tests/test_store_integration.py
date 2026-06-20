@@ -2,8 +2,17 @@
 
 import pytest
 
-from flowmap.store import StoreError, VectorStore, make_chunk_id
+from flowmap.store import FTS_INDEX_VERSION, StoreError, VectorStore, make_chunk_id, _fts_score
 from tests.conftest import DIMS, hash_vector
+
+
+def test_fts_score_preserves_real_zero():
+    """A real BM25 score of 0.0 must survive — an `_score or score or 0.0` chain
+    wrongly falls through on it, so _fts_score uses explicit None checks."""
+    assert _fts_score({"_score": 0.0, "score": 9.9}) == 0.0   # primary 0.0 wins over stale fallback
+    assert _fts_score({"_score": 3.5}) == 3.5
+    assert _fts_score({"score": 2.0}) == 2.0                   # fallback key when _score absent
+    assert _fts_score({}) == 0.0                               # neither present
 
 
 def test_get_chunks_for_file_warns_when_cap_hit(tmp_path, monkeypatch, caplog):
@@ -143,6 +152,97 @@ class TestUpsertAndSearch:
         results = store.search_vector(query_vec, limit=5)
         assert len(results) >= 1
         assert results[0].symbol_name == "hello"
+
+    def test_search_fts_finds_by_text(self, store):
+        """BM25/FTS leg returns chunks matching query terms in their text,
+        scoped by repo. Requires the FTS index to be built first."""
+        chunks, embeddings = _make_chunks("repo1", "src/auth.py", ["verify_token", "refresh_session"])
+        store.upsert_chunks(chunks, embeddings)
+        store.rebuild_fts_index()  # BM25 leg needs the FTS index present
+        results = store.search_fts("verify_token", repo_filter="repo1")
+        assert any(r.symbol_name == "verify_token" for r in results)
+        assert all(r.repo == "repo1" for r in results)
+
+    def test_search_fts_handles_code_punctuation(self, store):
+        """Regression guard: code queries carry punctuation/operators
+        (C++, foo-bar). LanceDB's default FTS is a match query (tokenize + OR),
+        NOT the Tantivy boolean parser, so these match as plain terms. This pins
+        that behavior — if a LanceDB upgrade flips the default to boolean parsing
+        (which would silently zero-out these queries), this test catches it and
+        we add query sanitization then. Verified non-issue on lancedb 0.30.2."""
+        chunk = {
+            "id": make_chunk_id(repo="repo1", file="p.cpp", symbol_name="parseCpp",
+                                chunk_type="function", chunk_index=0),
+            "repo": "repo1", "file": "p.cpp", "file_name": "p.cpp", "extension": ".cpp",
+            "language": "cpp", "chunk_type": "function", "symbol_name": "parseCpp",
+            "signature": "void parseCpp()", "parent_symbol": "", "parent_signature": "",
+            "start_line": 1, "end_line": 2, "chunk_index": 0,
+            "text": "// C++ parser for foo-bar tokens\nvoid parseCpp() {}",
+        }
+        store.upsert_chunks([chunk], [hash_vector("repo1:p.cpp:parseCpp")])
+        store.rebuild_fts_index()
+        assert any(r.symbol_name == "parseCpp"
+                   for r in store.search_fts("C++ parser", repo_filter="repo1"))
+        assert any(r.symbol_name == "parseCpp"
+                   for r in store.search_fts("foo-bar", repo_filter="repo1"))
+
+    def test_search_fts_phrase_query(self, store):
+        """Quoted phrase queries (`"connection pool"`) are the most common
+        advanced-search gesture and must WORK, not crash. Without positions in
+        the FTS index, Lance raises 'position is not found ... required for phrase
+        queries', which search_fts swallows to [] AND mislabels as a broken-index
+        WARNING. The index must be built with positions so phrases actually match."""
+        chunk = {
+            "id": make_chunk_id(repo="repo1", file="db.py", symbol_name="connect_pool",
+                                chunk_type="function", chunk_index=0),
+            "repo": "repo1", "file": "db.py", "file_name": "db.py", "extension": ".py",
+            "language": "python", "chunk_type": "function", "symbol_name": "connect_pool",
+            "signature": "def connect_pool()", "parent_symbol": "", "parent_signature": "",
+            "start_line": 1, "end_line": 2, "chunk_index": 0,
+            "text": "def connect_pool():\n    # open the database connection pool for reuse",
+        }
+        store.upsert_chunks([chunk], [hash_vector("repo1:db.py:connect_pool")])
+        store.rebuild_fts_index()
+        results = store.search_fts('"connection pool"', repo_filter="repo1")
+        assert any(r.symbol_name == "connect_pool" for r in results)
+
+    def test_search_fts_missing_index_returns_empty(self, store):
+        """search_fts is best-effort: with no FTS index built it degrades to []
+        rather than raising (so an un-rebuilt profile doesn't break hybrid search)."""
+        chunks, embeddings = _make_chunks("repo1", "a.py", ["foo"])
+        store.upsert_chunks(chunks, embeddings)
+        # deliberately NOT calling rebuild_fts_index
+        assert store.search_fts("foo") == []
+
+    def test_search_fts_warns_when_index_present_but_query_fails(self, store, monkeypatch, caplog):
+        """A broken FTS index (query raises) must WARN, so the leg can't silently
+        degrade to invisible — distinct from the quiet 'not built yet' case."""
+        import logging
+        chunks, embeddings = _make_chunks("r", "a.py", ["foo"])
+        store.upsert_chunks(chunks, embeddings)
+        store.rebuild_fts_index()  # FTS index is present
+
+        real_open = store._db.open_table
+        def boom(name):
+            t = real_open(name)
+            monkeypatch.setattr(t, "search", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts broke")))
+            return t
+        monkeypatch.setattr(store._db, "open_table", boom)
+
+        with caplog.at_level(logging.WARNING):
+            assert store.search_fts("foo", repo_filter="r") == []
+        assert any(rec.levelno == logging.WARNING and "FTS" in rec.message for rec in caplog.records)
+
+    def test_search_fts_no_warning_when_index_absent(self, store, caplog):
+        """The 'index not built yet' path stays at debug — a missing FTS index is
+        expected on an un-rebuilt profile and must not spam warnings."""
+        import logging
+        chunks, embeddings = _make_chunks("r", "a.py", ["foo"])
+        store.upsert_chunks(chunks, embeddings)
+        # deliberately NOT calling rebuild_fts_index
+        with caplog.at_level(logging.WARNING):
+            store.search_fts("foo")
+        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
 
     def test_upsert_and_search_symbol_exact(self, store):
         chunks, embeddings = _make_chunks("repo1", "src/main.py", ["process_data", "validate"])
@@ -401,3 +501,40 @@ class TestSymbolSearchAccuracy:
         results = store.search_symbol("calc_100%", repo_filter="repo1")
         names = [r.symbol_name for r in results]
         assert "calc_100%" in names
+
+
+# ---------------------------------------------------------------------------
+# rebuild_fts_index returns the version it ACTUALLY built (outcome, not intent)
+# ---------------------------------------------------------------------------
+
+def test_rebuild_fts_index_returns_current_version_on_success(store):
+    """A successful positioned rebuild reports FTS_INDEX_VERSION."""
+    chunks, embeddings = _make_chunks("r", "a.py", ["foo"])
+    store.upsert_chunks(chunks, embeddings)
+    assert store.rebuild_fts_index() == FTS_INDEX_VERSION
+
+
+def test_rebuild_fts_index_absent_table_returns_none(store):
+    """An absent table builds nothing → None, not a false 'current' stamp."""
+    assert store.rebuild_fts_index("ghost-profile") is None
+
+
+def test_rebuild_fts_index_positionless_fallback_reports_v1(store, monkeypatch):
+    """When with_position is unsupported, the positionless fallback reports '1'
+    so the stamp reflects reality and the migration re-fires after an upgrade."""
+    chunks, embeddings = _make_chunks("r", "a.py", ["foo"])
+    store.upsert_chunks(chunks, embeddings)
+
+    real_open = store._db.open_table
+    def wrapped(name):
+        t = real_open(name)
+        orig = t.create_fts_index
+        def fake(col, replace=True, **kwargs):
+            if "with_position" in kwargs:
+                raise TypeError("create_fts_index() got an unexpected kwarg 'with_position'")
+            return orig(col, replace=replace)
+        monkeypatch.setattr(t, "create_fts_index", fake)
+        return t
+    monkeypatch.setattr(store._db, "open_table", wrapped)
+
+    assert store.rebuild_fts_index() == "1"
