@@ -476,7 +476,7 @@ def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
                     err=True,
                 )
 
-        # --- Hybrid mode (default): 3-way fusion ---
+        # --- Hybrid mode (default): 4-way fusion (ripgrep + BM25/FTS + vector + symbol) ---
         if mode == "hybrid":
             from flowmap.search.hybrid import hybrid_search
 
