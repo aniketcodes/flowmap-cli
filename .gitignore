@@ -39,3 +39,5 @@ htmlcov/
 .idea/
 
 eval/
+
+*.log
