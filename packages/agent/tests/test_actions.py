@@ -151,16 +151,26 @@ class TestActionPlanner:
 # ---------------------------------------------------------------------------
 
 class TestBlockKitBuilder:
-    def test_builds_section_and_actions(self):
+    def test_builds_divider_and_actions(self):
+        """Blocks include divider + actions (no diagnosis section — that's in the streaming message)."""
         blocks = build_action_blocks(
             "Root cause: Redis timeout",
             [{"id": "create_thread", "label": "Create Thread", "description": "Open thread"}],
             "123.456",
         )
-        assert len(blocks) >= 2
-        assert blocks[0]["type"] == "section"
-        assert blocks[1]["type"] == "divider"
-        assert blocks[2]["type"] == "actions"
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "divider"
+        assert blocks[1]["type"] == "actions"
+
+    def test_no_diagnosis_section_in_blocks(self):
+        """Diagnosis text is NOT included in action blocks (prevents double-post)."""
+        blocks = build_action_blocks(
+            "Root cause: Redis timeout in config.js",
+            [{"id": "create_thread", "label": "Create Thread", "description": "Open thread"}],
+            "123.456",
+        )
+        section_blocks = [b for b in blocks if b["type"] == "section"]
+        assert len(section_blocks) == 0
 
     def test_action_button_has_correct_format(self):
         blocks = build_action_blocks(
@@ -168,15 +178,15 @@ class TestBlockKitBuilder:
             [{"id": "create_thread", "label": "Create Thread", "description": "Open thread"}],
             "123.456",
         )
-        button = blocks[2]["elements"][0]
+        button = blocks[1]["elements"][0]
         assert button["action_id"] == "create_thread|123.456"
         assert button["value"] == "create_thread"
         assert button["text"]["text"] == "Create Thread"
 
-    def test_empty_actions_no_actions_block(self):
+    def test_empty_actions_returns_empty_list(self):
+        """With no actions, returns empty list (no divider, no section)."""
         blocks = build_action_blocks("Diagnosis", [], "123.456")
-        assert len(blocks) == 2
-        assert all(b["type"] != "actions" for b in blocks)
+        assert len(blocks) == 0
 
     def test_max_four_buttons(self):
         many_actions = [{"id": f"action_{i}", "label": f"Action {i}", "description": f"Desc {i}"} for i in range(10)]
@@ -198,7 +208,9 @@ class TestActionExecutor:
         mock_client.chat_postMessage.assert_called_once()
 
     def test_execute_explain_code(self):
-        executor = ActionExecutor(client=Mock())
+        mock_agent = Mock()
+        mock_agent.diagnose.return_value = "The Redis timeout occurs because..."
+        executor = ActionExecutor(client=Mock(), agent=mock_agent)
         result = executor.execute("explain_code", "123.456", "C123", "Redis timeout")
         assert "explanation" in result.lower()
 
@@ -218,6 +230,288 @@ class TestActionExecutor:
         executor = ActionExecutor(client=None)
         result = executor.execute("create_thread", "123.456", "C123", "Redis timeout")
         assert "not available" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Slice 1: show_history displays repository history
+# ---------------------------------------------------------------------------
+
+class TestShowHistory:
+    def test_show_history_displays_repository_history_in_thread(self):
+        """show_history fetches history via LLM-extracted query and posts to thread."""
+        from agent.server import CommitInfo
+        
+        mock_llm = Mock()
+        mock_llm.chat.return_value = Mock(content='{"query": "redis timeout", "repos": []}')
+        
+        mock_agent = Mock()
+        mock_agent.llm = mock_llm
+        
+        mock_flowmap = Mock()
+        mock_flowmap.call_tool.return_value = [
+            CommitInfo(sha="abc123", message="Fix timeout", author="alice", date="2026-01-01", repo="zedbe-aggregator"),
+        ]
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=mock_flowmap)
+        
+        result = executor.execute(
+            "show_history",
+            "123.456",
+            "C123",
+            "Redis timeout in zedbe-aggregator",
+            thread_history=[{"user": "U1", "text": "why redis timeouts?"}],
+        )
+        
+        assert result == "History posted"
+        mock_client.chat_postMessage.assert_called_once()
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert call_kwargs["channel"] == "C123"
+        assert call_kwargs["thread_ts"] == "123.456"
+        # LLM was called to extract query
+        mock_llm.chat.assert_called_once()
+
+    def test_show_history_searches_all_repos_when_no_specific_repo(self):
+        """show_history calls flowmap_history without repo filter (searches all repos)."""
+        from agent.server import CommitInfo
+        
+        mock_llm = Mock()
+        mock_llm.chat.return_value = Mock(content='{"query": "redis timeout", "repos": []}')
+        
+        mock_agent = Mock()
+        mock_agent.llm = mock_llm
+        
+        mock_flowmap = Mock()
+        mock_flowmap.call_tool.return_value = [
+            CommitInfo(sha="abc", message="Fix", author="a", date="2026-01-01", repo="zedbe-aggregator"),
+        ]
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=mock_flowmap)
+        
+        executor.execute(
+            "show_history", "123.456", "C123", "Redis timeout",
+            thread_history=[{"user": "U1", "text": "why redis timeouts?"}],
+        )
+        
+        # Should call flowmap_history with query, no repo filter
+        call_args = mock_flowmap.call_tool.call_args
+        assert call_args[0][0] == "flowmap_history"
+        assert "query" in call_args[0][1]
+        assert call_args[0][1].get("repo") is None
+
+    def test_show_history_groups_cross_repo_commits_by_repo(self):
+        """Cross-repo results are grouped by repo name in the output."""
+        from agent.server import CommitInfo
+        
+        mock_llm = Mock()
+        mock_llm.chat.return_value = Mock(content='{"query": "redis timeout", "repos": []}')
+        
+        mock_agent = Mock()
+        mock_agent.llm = mock_llm
+        
+        mock_flowmap = Mock()
+        mock_flowmap.call_tool.return_value = [
+            CommitInfo(sha="abc", message="Fix timeout", author="a", date="2026-01-01", repo="zedbe-aggregator"),
+            CommitInfo(sha="def", message="Add retry", author="b", date="2026-01-02", repo="zedbe-journey-ms"),
+        ]
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=mock_flowmap)
+        
+        executor.execute(
+            "show_history", "123.456", "C123", "Redis timeout",
+            thread_history=[{"user": "U1", "text": "why redis timeouts?"}],
+        )
+        
+        posted_text = mock_client.chat_postMessage.call_args.kwargs["text"]
+        assert "zedbe-aggregator" in posted_text
+        assert "zedbe-journey-ms" in posted_text
+
+    def test_show_history_uses_thread_history_for_query_context(self):
+        """show_history builds LLM prompt from thread history, not just diagnosis."""
+        mock_llm = Mock()
+        mock_llm.chat.return_value = Mock(content='{"query": "redis timeout", "repos": []}')
+        
+        mock_agent = Mock()
+        mock_agent.llm = mock_llm
+        
+        mock_flowmap = Mock()
+        mock_flowmap.call_tool.return_value = []
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=mock_flowmap)
+        
+        thread_history = [
+            {"user": "U1", "text": "why are we getting redis timeouts?"},
+            {"user": "U1", "text": "it started after the deploy"},
+        ]
+        
+        executor.execute(
+            "show_history", "123.456", "C123", "diagnosis here",
+            thread_history=thread_history,
+        )
+        
+        # LLM prompt should include thread history content
+        prompt = mock_llm.chat.call_args[0][0]
+        assert "redis timeouts" in prompt
+        assert "deploy" in prompt
+
+    def test_show_history_falls_back_without_llm(self):
+        """Without LLM, falls back to diagnosis as query."""
+        from agent.server import CommitInfo
+        
+        mock_flowmap = Mock()
+        mock_flowmap.call_tool.return_value = [
+            CommitInfo(sha="abc", message="Fix", author="a", date="2026-01-01", repo="r1"),
+        ]
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=None, client=mock_client, flowmap=mock_flowmap)
+        
+        result = executor.execute(
+            "show_history", "123.456", "C123", "Redis timeout in zedbe-aggregator",
+            thread_history=[],
+        )
+        
+        assert result == "History posted"
+        # Should use diagnosis as query
+        call_args = mock_flowmap.call_tool.call_args
+        assert call_args[0][1].get("query") is not None
+
+    def test_show_history_handles_flowmap_failure(self):
+        """show_history handles flowmap errors gracefully."""
+        mock_llm = Mock()
+        mock_llm.chat.return_value = Mock(content='{"query": "redis", "repos": []}')
+        
+        mock_agent = Mock()
+        mock_agent.llm = mock_llm
+        
+        mock_flowmap = Mock()
+        mock_flowmap.call_tool.side_effect = Exception("FlowMap down")
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=mock_flowmap)
+        
+        result = executor.execute(
+            "show_history",
+            "123.456",
+            "C123",
+            "Redis timeout in zedbe-aggregator",
+            thread_history=[{"user": "U1", "text": "why?"}],
+        )
+        
+        assert "failed" in result.lower() or "error" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Slice 2: explain_code displays code explanation
+# ---------------------------------------------------------------------------
+
+class TestExplainCode:
+    def test_explain_code_displays_code_explanation_in_thread(self):
+        """explain_code generates explanation and posts to thread."""
+        mock_agent = Mock()
+        mock_agent.diagnose.return_value = "The Redis timeout occurs because connection pool is exhausted."
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=Mock())
+        
+        result = executor.execute(
+            "explain_code",
+            "123.456",
+            "C123",
+            "Redis timeout in src/config.js:15",
+        )
+        
+        assert result == "Explanation posted"
+        mock_client.chat_postMessage.assert_called_once()
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert call_kwargs["channel"] == "C123"
+        assert call_kwargs["thread_ts"] == "123.456"
+        assert "Redis timeout" in call_kwargs["text"]
+
+    def test_explain_code_includes_thread_history_in_prompt(self):
+        """explain_code includes thread history in prompt."""
+        mock_agent = Mock()
+        mock_agent.diagnose.return_value = "Explanation"
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=Mock())
+        
+        thread_history = [
+            {"user": "U123", "text": "We saw this issue yesterday"},
+            {"user": "U456", "text": "It happens during peak hours"},
+        ]
+        
+        executor.execute(
+            "explain_code",
+            "123.456",
+            "C123",
+            "Redis timeout",
+        )
+        
+        call_args = mock_agent.diagnose.call_args[0][0]
+        assert "Redis timeout" in call_args
+
+    def test_explain_code_handles_agent_failure(self):
+        """explain_code handles agent errors gracefully."""
+        mock_agent = Mock()
+        mock_agent.diagnose.side_effect = Exception("Agent down")
+        
+        mock_client = Mock()
+        executor = ActionExecutor(agent=mock_agent, client=mock_client, flowmap=Mock())
+        
+        result = executor.execute(
+            "explain_code",
+            "123.456",
+            "C123",
+            "Redis timeout",
+        )
+        
+        assert "failed" in result.lower() or "error" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Slice 4: idempotency prevents duplicate execution
+# ---------------------------------------------------------------------------
+
+class TestIdempotency:
+    def test_same_action_same_message_prevents_duplicate_execution(self):
+        """Same action on same message only executes once."""
+        mock_client = Mock()
+        executor = ActionExecutor(agent=Mock(), client=mock_client, flowmap=Mock())
+        
+        result1 = executor.execute("create_thread", "123.456", "C123", "test")
+        result2 = executor.execute("create_thread", "123.456", "C123", "test")
+        
+        assert result1 == "Thread created"
+        assert result2 == "Already executed"
+        assert mock_client.chat_postMessage.call_count == 1
+
+    def test_same_action_different_message_executes(self):
+        """Same action on different messages executes both."""
+        mock_client = Mock()
+        executor = ActionExecutor(agent=Mock(), client=mock_client, flowmap=Mock())
+        
+        result1 = executor.execute("create_thread", "111.111", "C123", "test1")
+        result2 = executor.execute("create_thread", "222.222", "C123", "test2")
+        
+        assert result1 == "Thread created"
+        assert result2 == "Thread created"
+        assert mock_client.chat_postMessage.call_count == 2
+
+    def test_different_action_same_message_executes(self):
+        """Different actions on same message both execute."""
+        mock_client = Mock()
+        executor = ActionExecutor(agent=Mock(), client=mock_client, flowmap=Mock())
+        
+        result1 = executor.execute("create_thread", "123.456", "C123", "test")
+        result2 = executor.execute("notify_team", "123.456", "C123", "test")
+        
+        assert result1 == "Thread created"
+        assert result2 == "Team notified"
+        assert mock_client.chat_postMessage.call_count == 2
 
 
 # ---------------------------------------------------------------------------

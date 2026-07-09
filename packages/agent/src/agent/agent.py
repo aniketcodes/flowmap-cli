@@ -25,7 +25,17 @@ Rules — you MUST follow these:
 7. Trace the full flow — if you find a constant, find where it's used; if you find a function, find where it's called
 8. Every claim must reference a file:line that you actually read
 9. Combine code findings with Slack conversation context for a complete diagnosis
-10. Stop calling tools only when you have read the code and have evidence for your answer"""
+10. Stop calling tools only when you have read the code and have evidence for your answer
+11. NEVER reference Slack channels or conversations you haven't explicitly searched with slack_search or slack_history. If you didn't call a Slack tool, don't mention Slack.
+12. NEVER cite specific TTL values, durations, or config values unless you read them from the actual code with flowmap_cat
+
+FORMAT YOUR FINAL_ANSWER for Slack readability:
+- Use **bold** for section headers and key terms
+- Use bullet points (-) for lists and enumerations
+- Put file paths and code references in backticks: `src/file.ts:42`
+- Break long answers into sections with headers
+- Keep each bullet point to one line
+- Start with a one-line summary, then details"""
 
 
 class Agent:
@@ -117,7 +127,8 @@ class Agent:
         """Not used — kept for backward compatibility."""
         return []
 
-    def diagnose(self, query: str, on_progress: Callable[[str], None] = None) -> str:
+    def diagnose(self, query: str, on_progress: Callable[[str], None] = None,
+                 max_steps: int = 15) -> str:
         """Let the LLM drive — it decides what tools to call."""
         progress = on_progress or self.on_progress
 
@@ -140,7 +151,7 @@ class Agent:
         cat_calls = 0  # Track how many files the LLM has actually read
 
         # Agentic loop — LLM calls tools until it gives FINAL_ANSWER
-        for step in range(15):
+        for step in range(max_steps):
             progress(f"🧠 Thinking... (step {step + 1})")
             prompt = self._format_messages(messages)
             response = self.llm.chat(prompt)

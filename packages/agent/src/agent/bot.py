@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # Avoid circular import by defining it here and exporting
 def _md_to_slack(text: str) -> str:
     """Convert markdown to Slack mrkdwn format."""
+    text = text.replace("→", "->")
     text = re.sub(r"```[\w]*\n(.*?)```", r"```\1```", text, flags=re.DOTALL)
     text = re.sub(r"\*\*(.*?)\*\*", r"*\1*", text)
     text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
@@ -166,7 +167,20 @@ class SlackBot:
                     self._action_registry.store(placeholder_ts, actions, diagnosis=response)
                     blocks = build_action_blocks(response, actions, placeholder_ts)
 
-            sm.finish(_md_to_slack(response), blocks=blocks)
+            sm.finish(_md_to_slack(response))
+
+            # Post action buttons as a separate message (chat_update doesn't support interactive elements)
+            if blocks and self.slack_app:
+                try:
+                    self.slack_app.client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=placeholder_ts,
+                        blocks=blocks,
+                        text="Suggested actions",
+                    )
+                except Exception as e:
+                    logger.error("Failed to post action buttons: %s", e)
+
             return response
 
         # Non-streaming fallback (backward compat — no channel, no slack_app)

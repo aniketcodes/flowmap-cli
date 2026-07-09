@@ -42,6 +42,7 @@ class CommitInfo:
     message: str
     author: str = ""
     date: str = ""
+    repo: str = ""
 
 
 class FlowMapMCPServer:
@@ -281,15 +282,20 @@ class FlowMapMCPServer:
                 embedding_backend=self._backend,
             )
 
-            commits = [
-                CommitInfo(
+            # Deduplicate by SHA — TimelineEntry is per (commit, file) pair
+            seen_shas = set()
+            commits = []
+            for entry in timeline.entries[:limit]:
+                if entry.commit.sha in seen_shas:
+                    continue
+                seen_shas.add(entry.commit.sha)
+                commits.append(CommitInfo(
                     sha=entry.commit.sha,
                     message=entry.commit.message,
                     author=entry.commit.author,
                     date=entry.commit.date,
-                )
-                for entry in timeline.entries[:limit]
-            ]
+                    repo=entry.repo,
+                ))
             logger.info("flowmap_history query=%s repo=%s commits=%d", query[:50], repo, len(commits))
             return commits
         except Exception as e:

@@ -203,3 +203,73 @@ class TestBotStreaming:
         # Placeholder was posted, then finish with error
         assert mock_client.chat_postMessage.call_count == 1
         assert mock_client.chat_update.call_count == 1
+
+
+class TestMdToSlack:
+    """Test markdown to Slack mrkdwn conversion."""
+
+    def test_bold_conversion(self):
+        """**bold** becomes *bold*."""
+        from agent.bot import _md_to_slack
+        assert _md_to_slack("**Redis** timeout") == "*Redis* timeout"
+
+    def test_inline_code_preserved(self):
+        """`code` backticks preserved."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("Error in `src/config.js`")
+        assert "`src/config.js`" in result
+
+    def test_header_to_bold(self):
+        """# Header becomes *Header*."""
+        from agent.bot import _md_to_slack
+        assert _md_to_slack("# Diagnosis") == "*Diagnosis*"
+
+    def test_h2_header_to_bold(self):
+        """## Subheader becomes *Subheader*."""
+        from agent.bot import _md_to_slack
+        assert _md_to_slack("## Root Cause") == "*Root Cause*"
+
+    def test_markdown_link_to_slack_link(self):
+        """[text](url) becomes <url|text>."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("[file](https://github.com/repo/src/file.py)")
+        assert "<https://github.com/repo/src/file.py|file>" in result
+
+    def test_bullet_list_conversion(self):
+        """- item becomes • item."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("- First\n- Second")
+        assert "• First" in result
+        assert "• Second" in result
+
+    def test_fenced_code_block_preserved(self):
+        """```code``` blocks preserved with backticks."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("```\nconst x = 1;\n```")
+        assert "```" in result
+        assert "const x = 1;" in result
+
+    def test_multiple_bold_in_one_line(self):
+        """Multiple **bold** sections all converted."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("**Redis** and **Postgres** are down")
+        assert "*Redis*" in result
+        assert "*Postgres*" in result
+
+    def test_plain_text_unchanged(self):
+        """Plain text without markdown stays the same."""
+        from agent.bot import _md_to_slack
+        assert _md_to_slack("Everything is fine") == "Everything is fine"
+
+    def test_combined_bold_and_code(self):
+        """Mix of bold and inline code in one line."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("Error in `src/config.js:15` with **Redis** timeout")
+        assert "`src/config.js:15`" in result
+        assert "*Redis*" in result
+
+    def test_strips_trailing_whitespace(self):
+        """Output is stripped of leading/trailing whitespace."""
+        from agent.bot import _md_to_slack
+        result = _md_to_slack("  some text  ")
+        assert result == "some text"

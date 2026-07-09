@@ -86,7 +86,7 @@ _ALL_ACTIONS = {
 
 _DEFAULT_ACTIONS = ["create_thread", "explain_code"]
 
-_PLANNER_SYSTEM_PROMPT = """You are an operations assistant. Given a diagnosis of a production issue,
+_PLANNER_SYSTEM_PROMPT = """You are an operations assistant. Given a user's question and a diagnosis of a production issue,
 recommend up to 2 actions the user can take.
 
 Available actions:
@@ -99,9 +99,11 @@ Respond with ONLY a JSON object:
 {"actions": ["action_id_1", "action_id_2"]}
 
 Rules:
-- Pick the 1-2 most relevant actions
-- Always include "explain_code" if the diagnosis mentions specific files or code
-- Always include "create_thread" if the issue is complex
+- Pick the 1-2 most relevant actions based on BOTH the user's question and the diagnosis
+- Include "show_history" if the user asks about changes, history, recent activity, or what changed
+- Include "show_history" if the diagnosis references specific commits or commit messages
+- Include "explain_code" if the diagnosis mentions specific files or code
+- Include "create_thread" if the issue is complex and needs team discussion
 - If unsure, default to ["create_thread", "explain_code"]"""
 
 
@@ -111,21 +113,36 @@ class ActionPlanner:
     def __init__(self, llm=None):
         self.llm = llm
 
-    def recommend(self, diagnosis: str, tools_used: list[str] = None) -> list[dict]:
-        """Returns list of action dicts with id, label, description."""
-        action_ids = self._get_action_ids(diagnosis, tools_used)
+    def recommend(self, diagnosis: str, tools_used: list[str] = None,
+                  user_question: str = None) -> list[dict]:
+        """Returns list of action dicts with id, label, description.
+        
+        show_history is always included — seeing recent changes is universally useful.
+        """
+        action_ids = self._get_action_ids(diagnosis, tools_used, user_question)
+        # Always include show_history
+        if "show_history" not in action_ids:
+            action_ids.append("show_history")
+        # Max 3 actions
+        action_ids = action_ids[:3]
         return [_ALL_ACTIONS[aid] for aid in action_ids if aid in _ALL_ACTIONS]
 
-    def _get_action_ids(self, diagnosis: str, tools_used: list[str] = None) -> list[str]:
+    def _get_action_ids(self, diagnosis: str, tools_used: list[str] = None,
+                        user_question: str = None) -> list[str]:
         if not self.llm:
+            logger.info("No LLM, using default actions")
             return list(_DEFAULT_ACTIONS)
 
         try:
+            user_content = f"User's question:\n{user_question or '(not provided)'}\n\nDiagnosis:\n{diagnosis}"
             messages = [
                 {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Diagnosis:\n{diagnosis}"},
+                {"role": "user", "content": user_content},
             ]
-            response = self.llm.chat("\n".join(m["content"] for m in messages))
+            prompt = "\n".join(m["content"] for m in messages)
+            logger.info("ActionPlanner calling LLM...")
+            response = self.llm.chat(prompt)
+            logger.info("ActionPlanner LLM response: %.200s", response.content)
             return self._parse_response(response.content)
         except Exception as e:
             logger.warning("ActionPlanner LLM error: %s, using defaults", e)
@@ -156,21 +173,20 @@ class ActionPlanner:
 def build_action_blocks(
     diagnosis: str, actions: list[dict], message_ts: str
 ) -> list[dict]:
-    """Build Slack Block Kit blocks with action buttons."""
-    blocks = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": diagnosis[:3000]},
-        },
-        {"type": "divider"},
-    ]
+    """Build Slack Block Kit blocks with action buttons.
+
+    Does NOT include diagnosis text — that's already in the streaming message.
+    """
+    blocks = []
 
     if actions:
+        blocks.append({"type": "divider"})
+
         elements = []
         for action in actions[:4]:  # Max 4 buttons
             elements.append({
                 "type": "button",
-                "text": {"type": "plain_text", "text": action["label"]},
+                "text": {"type": "plain_text", "text": action["label"], "emoji": True},
                 "action_id": f"{action['id']}|{message_ts}",
                 "value": action["id"],
             })
@@ -190,19 +206,37 @@ def build_action_blocks(
 class ActionExecutor:
     """Executes approved actions via Slack API."""
 
-    def __init__(self, client=None):
+    def __init__(self, client=None, agent=None, flowmap=None):
         self.client = client
+        self.agent = agent
+        self.flowmap = flowmap
+        self._executed = {}  # { (action_id, message_ts): datetime }
+        self._ttl_hours = 24
 
-    def execute(self, action_id: str, message_ts: str, channel_id: str, diagnosis: str) -> str:
+    def execute(self, action_id: str, message_ts: str, channel_id: str, diagnosis: str,
+                thread_history: list = None) -> str:
+        # Idempotency check
+        from datetime import datetime, timedelta
+        exec_key = (action_id, message_ts)
+        if exec_key in self._executed:
+            exec_time = self._executed[exec_key]
+            if datetime.now() - exec_time < timedelta(hours=self._ttl_hours):
+                return "Already executed"
+        
         if action_id == "create_thread":
-            return self._create_thread(message_ts, channel_id, diagnosis)
+            result = self._create_thread(message_ts, channel_id, diagnosis)
         elif action_id == "explain_code":
-            return self._explain_code(diagnosis)
+            result = self._explain_code(message_ts, channel_id, diagnosis, thread_history)
         elif action_id == "notify_team":
-            return self._notify_team(channel_id, diagnosis)
+            result = self._notify_team(channel_id, diagnosis)
         elif action_id == "show_history":
-            return self._show_history(diagnosis)
-        return f"Unknown action: {action_id}"
+            result = self._show_history(message_ts, channel_id, diagnosis, thread_history)
+        else:
+            return f"Unknown action: {action_id}"
+        
+        # Mark as executed
+        self._executed[exec_key] = datetime.now()
+        return result
 
     def _create_thread(self, message_ts: str, channel_id: str, diagnosis: str) -> str:
         if not self.client:
@@ -217,8 +251,29 @@ class ActionExecutor:
         except Exception as e:
             return f"Failed to create thread: {e}"
 
-    def _explain_code(self, diagnosis: str) -> str:
-        return f"Code explanation will be provided for the identified issue."
+    def _explain_code(self, message_ts: str, channel_id: str, diagnosis: str,
+                      thread_history: list = None) -> str:
+        """Explain code using agent with focused prompt."""
+        if not self.agent:
+            return "Agent not available"
+        
+        try:
+            prompt = f"Explain the code related to this diagnosis in detail:\n{diagnosis}"
+            if thread_history:
+                context = "\n".join([f"- {msg.get('text', '')}" for msg in thread_history[:5]])
+                prompt += f"\n\nConversation context:\n{context}"
+            prompt += "\n\nRead the relevant files and explain the code flow, key functions, and how they work together."
+            explanation = self.agent.diagnose(prompt, max_steps=8)
+        except Exception as e:
+            return f"Failed to explain code: {e}"
+        
+        from agent.bot import _md_to_slack
+        self.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text=_md_to_slack(f"*Code Explanation:*\n\n{explanation}"),
+        )
+        return "Explanation posted"
 
     def _notify_team(self, channel_id: str, diagnosis: str) -> str:
         if not self.client:
@@ -232,5 +287,123 @@ class ActionExecutor:
         except Exception as e:
             return f"Failed to notify team: {e}"
 
-    def _show_history(self, diagnosis: str) -> str:
-        return "Recent commit history will be displayed."
+    def _show_history(self, message_ts: str, channel_id: str, diagnosis: str,
+                      thread_history: list = None) -> str:
+        """Show recent commits using FlowMap, with LLM-extracted query from thread context.
+        
+        Searches across ALL repos (no string-matching for repo name).
+        Results grouped by repo — handles cross-repo changes naturally.
+        """
+        if not self.flowmap:
+            return "FlowMap not available"
+
+        # Get available repos for LLM context
+        try:
+            repos_data = self.flowmap.call_tool("flowmap_repos", {})
+            known_repos = [
+                r.get("name", str(r)) if isinstance(r, dict) else str(r)
+                for r in (repos_data or [])
+            ]
+        except Exception:
+            known_repos = []
+
+        # Build context from thread history + diagnosis
+        context_parts = []
+        if thread_history:
+            context_parts.extend([f"- {msg.get('text', '')}" for msg in thread_history[:10]])
+        if diagnosis:
+            context_parts.append(f"- Diagnosis: {diagnosis[:500]}")
+        context = "\n".join(context_parts)
+
+        # Use LLM to extract a concise search query from conversation
+        query = None
+        llm = getattr(self.agent, 'llm', None) if self.agent else None
+        if llm and context:
+            prompt = (
+                "Extract a concise search query (2-5 words) for finding relevant git commits "
+                "based on this conversation. The query should match commit messages.\n\n"
+                f"Known repos: {', '.join(known_repos)}\n\n"
+                f"Conversation:\n{context}\n\n"
+                'Return JSON: {"query": "concise search terms"}\n'
+                "Example: {\"query\": \"redis timeout config\"}"
+            )
+            try:
+                response = llm.chat(prompt)
+                import json
+                raw = response.content.strip()
+                # Strip markdown code fences if present (```json ... ```)
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+                    if raw.endswith("```"):
+                        raw = raw[:-3]
+                    raw = raw.strip()
+                # Try parsing as JSON
+                try:
+                    data = json.loads(raw)
+                    query = data.get("query")
+                except json.JSONDecodeError:
+                    # LLM might return plain text — use it directly if short
+                    text = raw.strip('"').strip("'")
+                    if text and len(text) < 200 and not text.startswith("```"):
+                        query = text
+            except Exception as e:
+                logger.warning("show_history llm_call_failed error=%s", e)
+                query = None
+
+        # Fallback: extract keywords from diagnosis (not full sentence)
+        if not query:
+            if diagnosis:
+                # Take first few meaningful words
+                words = diagnosis.split()[:5]
+                query = " ".join(words)
+            else:
+                query = "recent changes"
+
+        logger.info("show_history query=%s", query[:100])
+
+        # Call flowmap_history (no repo filter → searches ALL repos)
+        try:
+            result = self.flowmap.call_tool("flowmap_history", {"query": query})
+        except Exception as e:
+            return f"Failed to fetch history: {e}"
+
+        # Group commits by repo (deduplicated by SHA)
+        from agent.server import CommitInfo
+        if isinstance(result, list) and result and isinstance(result[0], CommitInfo):
+            sections = self._format_commits_by_repo(result)
+        elif isinstance(result, str):
+            sections = result
+        else:
+            sections = self._format_commits_by_repo(result)
+
+        # Post to thread
+        from agent.bot import _md_to_slack
+        self.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text=_md_to_slack(f"*Recent Changes:*\n\n{sections}"),
+        )
+        return "History posted"
+
+    @staticmethod
+    def _format_commits_by_repo(commits) -> str:
+        """Format commits grouped by repo name, deduplicated by SHA."""
+        by_repo = {}
+        seen_shas = set()
+        for c in commits:
+            sha = getattr(c, 'sha', '???')
+            if sha in seen_shas:
+                continue
+            seen_shas.add(sha)
+            repo = getattr(c, 'repo', 'unknown')
+            by_repo.setdefault(repo, []).append(c)
+
+        lines = []
+        for repo, repo_commits in by_repo.items():
+            lines.append(f"*{repo}*")
+            for c in repo_commits:
+                sha = getattr(c, 'sha', '???')[:7]
+                msg = getattr(c, 'message', '').split('\n')[0][:80]
+                lines.append(f"  • `{sha}` {msg}")
+            lines.append("")
+        return "\n".join(lines).strip()
