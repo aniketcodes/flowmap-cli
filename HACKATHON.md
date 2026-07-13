@@ -186,8 +186,8 @@ The PR includes both the test and the fix.
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/aniketcodes/repo-embedd.git
-cd repo-embedd
+git clone https://github.com/aniketcodes/flowmap-cli.git
+cd flowmap-cli
 pip install -e .
 
 # 2. Start Ollama (for embeddings only — LLM is cloud)
@@ -258,7 +258,7 @@ All integrations are unified through the `MCPAdapter` abstract base class with O
 ## Project Structure
 
 ```
-repo-embedd/
+flowmap-cli/
 ├── run_bot.py                    # Bot entry point (Socket Mode)
 ├── flowmap/                      # Code intelligence engine
 │   ├── cli.py                    # CLI (11 commands)
@@ -311,7 +311,7 @@ repo-embedd/
 
 ## Links
 
-- **GitHub**: https://github.com/aniketcodes/repo-embedd
+- **GitHub**: https://github.com/aniketcodes/flowmap-cli
 - **Architecture Diagram**: `diagram.html`
 - **Sequence Diagram**: `SUBMISSION.md`
 

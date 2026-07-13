@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "repo-embedd"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "flowmap-cli"))
 
 from flowmap.config import load_config
 from flowmap.embeddings import create_backend

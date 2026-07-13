@@ -214,7 +214,7 @@ PYTHONPATH=packages/agent/src:packages/core/src:packages/slack/src \
 ## Files
 
 ```
-repo-embedd/
+flowmap-cli/
 ├── run_bot.py                    # Bot entry point
 ├── flowmap/                      # Code intelligence engine
 │   ├── cli.py                    # CLI (11 commands)
