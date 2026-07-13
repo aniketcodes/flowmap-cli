@@ -52,7 +52,7 @@ except Exception as e:
     logger.warning("Slack MCP connection failed: %s", e)
 
 agent = Agent(mcp=mcp, llm=llm, slack_client=slack_client, slack_mcp_client=slack_mcp_client if slack_mcp_connected else None)
-logger.info("Agent ready with %d tools", len(agent._get_tool_definitions()))
+logger.info("Agent ready with %d tools", len(agent._build_openai_tools()))
 
 # Create Bolt app (for API calls)
 app = App(

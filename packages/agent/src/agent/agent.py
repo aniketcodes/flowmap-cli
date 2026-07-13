@@ -1,41 +1,40 @@
 """Agent Logic — LLM decides what tools to call, when to stop."""
 
-import json
 import logging
+import os
 from typing import Callable, Optional
 
 from .adapter import MCPAdapter
+from .llm import ToolCall
 
 logger = logging.getLogger(__name__)
 
-# Instructions for the LLM (tool definitions are generated dynamically)
-_TOOL_INSTRUCTIONS = """To call a tool, output exactly one line in this format:
-TOOL_CALL: tool_name(arg1, arg2, key=value)
+# Minimum tool calls before accepting a text response (prevents premature answers)
+MIN_TOOL_CALLS = 5
 
-To give your final answer, output exactly one line:
-FINAL_ANSWER: your answer here
+# Clean system prompt — rules only, no TOOL_CALL/FINAL_ANSWER format instructions
+_SYSTEM_PROMPT = """You are a code intelligence agent. Use tools to search code, read files, check Git history, and query Grafana.
 
-Rules — you MUST follow these:
-1. Call tools one at a time — wait for results before calling the next
-2. Start with flowmap_search to find relevant code
-3. Also search Slack for related conversations using slack_search or slack_history
-4. NEVER guess or assume — always read the actual file with flowmap_cat before concluding
-5. If a search result references a file, READ that file with flowmap_cat before using it in your answer
-6. If the query asks about timing, also call flowmap_history
-7. Trace the full flow — if you find a constant, find where it's used; if you find a function, find where it's called
-8. Every claim must reference a file:line that you actually read
-9. Combine code findings with Slack conversation context for a complete diagnosis
-10. Stop calling tools only when you have read the code and have evidence for your answer
-11. NEVER reference Slack channels or conversations you haven't explicitly searched with slack_search or slack_history. If you didn't call a Slack tool, don't mention Slack.
-12. NEVER cite specific TTL values, durations, or config values unless you read them from the actual code with flowmap_cat
+YOU MUST FOLLOW THESE RULES EXACTLY:
+1. Call one tool at a time. Wait for results before the next call.
+2. Use FlowMap and Grafana MCP tools extensively — search code, read files, check history, query logs and metrics.
+3. ALWAYS use flowmap_cat to read files before concluding. Every claim needs file:line evidence.
+4. If a tool returns ERROR or empty data — STOP. Do NOT retry. Switch to a different approach.
+5. After getting tool results, READ them carefully. When you have enough evidence, PROVIDE YOUR TEXT ANSWER. Do NOT keep calling tools indefinitely.
+6. Loki logs use job="demo-services" (not demo-order-service). Filter by service label or line filter (|=) to find specific service logs.
+7. Large numeric IDs (Snowflake IDs, etc.) may be ROUNDED in logs due to IEEE 754 precision loss. If searching for an exact ID fails, search for the first 10-12 digits as a partial match.
+8. ALWAYS search by request_id first — it's consistent across all services and shows the full transaction flow. When you find a request_id in logs, search Loki for ALL logs with that request_id to see what EVERY service did. Compare transaction IDs across services to detect modifications.
+9. When tracing a transaction through multiple services, check EVERY service in the chain (payment → order → ledger). Do NOT skip any service.
 
-FORMAT YOUR FINAL_ANSWER for Slack readability:
-- Use **bold** for section headers and key terms
-- Use bullet points (-) for lists and enumerations
-- Put file paths and code references in backticks: `src/file.ts:42`
-- Break long answers into sections with headers
-- Keep each bullet point to one line
-- Start with a one-line summary, then details"""
+ROOT CAUSE ANALYSIS — YOU MUST DO THIS FOR EVERY DIAGNOSIS:
+10. "not found", "timeout", or "error" = SYMPTOM. You are NOT done. Find WHY.
+11. Service A reports error → Search who SENDS data to Service A. Bug is in SENDER.
+12. Search ACROSS all repos, not just one.
+13. Name EXACT FILE AND LINE of root cause.
+
+FORMAT for Slack:
+- **Bold** headers, - bullet points, `file:line` references
+- Start with one-line summary, then details"""
 
 
 class Agent:
@@ -65,58 +64,100 @@ class Agent:
             from .slack_adapter import SlackAdapter
             self.adapters.append(SlackAdapter(client=slack_mcp_client))
 
+        # Auto-add GrafanaAdapter only if explicitly enabled via env var
+        # (avoids breaking tests that pass their own adapter list)
+        if not any(a.name() == "grafana" for a in self.adapters) and os.getenv("ENABLE_GRAFANA_ADAPTER", "1") == "1":
+            try:
+                from .grafana_adapter import GrafanaAdapter
+                grafana_adapter = GrafanaAdapter(
+                    grafana_url=os.getenv("GRAFANA_URL", "http://localhost:3000"),
+                    service_account_token=os.getenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", ""),
+                )
+                # Test connect — if it fails, skip adding the adapter
+                if grafana_adapter.connect():
+                    self.adapters.append(grafana_adapter)
+                    logger.info("GrafanaAdapter connected to mcp-grafana")
+                else:
+                    logger.warning("GrafanaAdapter failed to connect, skipping")
+            except Exception as e:
+                logger.warning("GrafanaAdapter not available: %s", e)
+
         # Build routing table once — O(1) lookup per tool call
         self._tool_routes: dict[str, MCPAdapter] = {}
         for adapter in self.adapters:
             for tool in adapter.list_tools():
                 self._tool_routes[tool["name"]] = adapter
 
-    def _build_tool_prompt(self) -> str:
-        """Generate tool definitions dynamically from adapters."""
-        lines = ["You have access to these tools:\n"]
-
-        for adapter in self.adapters:
-            for tool in adapter.list_tools():
-                # Build parameter signature from inputSchema
-                schema = tool.get("inputSchema", {})
-                props = schema.get("properties", {})
-                required = schema.get("required", [])
-
-                params = []
-                for param_name, param_info in props.items():
-                    default = "null" if param_name not in required else ""
-                    params.append(f"{param_name}={default}" if default else param_name)
-
-                lines.append(f"{tool['name']}({', '.join(params)})")
-                lines.append(f"  {tool.get('description', '')}\n")
-
-        # Add direct Slack tools if available
-        if self.slack_client:
-            lines.append("slack_history(channel_id, limit=50)")
-            lines.append("  Get recent messages from a Slack channel.\n")
-            lines.append("slack_search(query, channel_id=null, limit=10)")
-            lines.append("  Search Slack messages for a query.\n")
-            lines.append("slack_channels()")
-            lines.append("  List all Slack channels.\n")
-
-        lines.append(_TOOL_INSTRUCTIONS)
-        return "\n".join(lines)
-
-    def _get_tool_definitions(self) -> list[dict]:
-        """Return list of tool definitions (kept for backward compatibility)."""
+    def _build_openai_tools(self) -> list[dict]:
+        """Build OpenAI-format tool definitions for native tool calling."""
         tools = []
         for adapter in self.adapters:
             for tool in adapter.list_tools():
+                schema = tool.get("inputSchema", {})
+                openai_params = {
+                    "type": "object",
+                    "properties": {},
+                    "required": schema.get("required", []),
+                }
+                for prop_name, prop_info in schema.get("properties", {}).items():
+                    openai_params["properties"][prop_name] = {
+                        "type": prop_info.get("type", "string"),
+                        "description": prop_info.get("description", ""),
+                    }
+
                 tools.append({
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": openai_params,
+                    }
                 })
+
+        # Add Slack tools
         if self.slack_client:
             tools.extend([
-                {"name": "slack_history", "description": "Get recent messages from a Slack channel"},
-                {"name": "slack_search", "description": "Search Slack messages for a query"},
-                {"name": "slack_channels", "description": "List all Slack channels"},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "slack_history",
+                        "description": "Get recent messages from a Slack channel.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "channel_id": {"type": "string", "description": "Slack channel ID"},
+                                "limit": {"type": "integer", "description": "Number of messages to fetch"},
+                            },
+                            "required": ["channel_id"],
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "slack_search",
+                        "description": "Search Slack messages for a query.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search query"},
+                                "channel_id": {"type": "string", "description": "Optional channel ID to search in"},
+                                "limit": {"type": "integer", "description": "Number of results"},
+                            },
+                            "required": ["query"],
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "slack_channels",
+                        "description": "List all Slack channels the bot can access.",
+                        "parameters": {"type": "object", "properties": {}, "required": []}
+                    }
+                },
             ])
+
         return tools
 
     def classify_intent(self, message: str) -> str:
@@ -140,96 +181,106 @@ class Agent:
 
         progress("🤔 Analyzing your query...")
 
-        # Generate tool prompt dynamically from adapters
-        tool_prompt = self._build_tool_prompt()
+        tools = self._build_openai_tools()
 
         messages = [
-            {"role": "system", "content": tool_prompt},
+            {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": query},
         ]
 
-        cat_calls = 0  # Track how many files the LLM has actually read
+        total_tool_calls = 0
+        tool_call_history = {}  # {tool_name: count} — prevent repeated calls
 
-        # Agentic loop — LLM calls tools until it gives FINAL_ANSWER
         for step in range(max_steps):
             progress(f"🧠 Thinking... (step {step + 1})")
-            prompt = self._format_messages(messages)
-            response = self.llm.chat(prompt)
-            text = response.content.strip()
 
-            logger.info("agent_step=%d response=%.200s", step, text)
+            response = self.llm.chat(message="", messages=messages, tools=tools)
+            text = response.content.strip() if response.content else ""
 
-            # Check for final answer
-            if text.startswith("FINAL_ANSWER:"):
-                # Don't accept FINAL_ANSWER until at least one file was read
-                if cat_calls == 0:
-                    messages.append({"role": "assistant", "content": text})
+            logger.info("agent_step=%d tool_calls=%s args=%s content=%.200s",
+                        step,
+                        [tc.name for tc in response.tool_calls] if response.tool_calls else "none",
+                        {tc.name: tc.arguments for tc in response.tool_calls} if response.tool_calls else {},
+                        text)
+
+            # If LLM returned tool calls, execute them
+            if response.tool_calls:
+                # Block tools called too many times
+                blocked_tools = {name for name, count in tool_call_history.items() if count >= 3}
+                filtered_calls = [tc for tc in response.tool_calls if tc.name not in blocked_tools]
+
+                if not filtered_calls and response.tool_calls:
+                    # All requested tools are blocked — force LLM to answer
+                    blocked_list = ", ".join(blocked_tools)
                     messages.append({"role": "user", "content": (
-                        "You have not read any files yet. Before giving a final answer, "
-                        "you MUST call flowmap_cat to read the relevant source code. "
-                        "Do not guess — read the actual code first."
+                        f"You have called these tools too many times: {blocked_list}. "
+                        "They are not returning useful data. STOP calling them. "
+                        "Provide your best answer now based on what you have found so far."
                     )})
                     continue
-                progress("✅ Found it!")
-                return text[len("FINAL_ANSWER:"):].strip()
 
-            # Check for tool call
-            if text.startswith("TOOL_CALL:"):
-                tool_call = text[len("TOOL_CALL:"):].strip()
-                if "flowmap_cat(" in tool_call:
-                    cat_calls += 1
+                assistant_msg = {"role": "assistant", "content": text or None}
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments}
+                    }
+                    for tc in filtered_calls
+                ]
+                messages.append(assistant_msg)
 
-                # Extract tool name for progress
-                tool_name = tool_call.split("(")[0] if "(" in tool_call else tool_call
-                progress(f"🔍 Calling {tool_name}...")
+                for tc in filtered_calls:
+                    total_tool_calls += 1
+                    tool_call_history[tc.name] = tool_call_history.get(tc.name, 0) + 1
+                    progress(f"🔍 Calling {tc.name}...")
+                    result = self._execute_tool_call(tc)
+                    progress(f"✓ {tc.name} done")
 
-                result = self._execute_tool(tool_call)
-                progress(f"✓ {tool_name} done")
-                messages.append({"role": "assistant", "content": text})
-                messages.append({"role": "user", "content": f"Tool result:\n{result}"})
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+
                 continue
 
-            # LLM is reasoning — push it to use a tool or answer
-            messages.append({"role": "assistant", "content": text})
-            messages.append({"role": "user", "content": (
-                "You must respond with either TOOL_CALL: or FINAL_ANSWER:. "
-                "Do not explain your reasoning — just call the tool or give the answer."
-            )})
-            continue
+            # No tool calls — LLM is giving a text response
+            if text:
+                # Strip FINAL_ANSWER prefix if present (LLM may still generate it)
+                if text.startswith("FINAL_ANSWER:"):
+                    text = text[len("FINAL_ANSWER:"):].strip()
+
+                # Accept answer after minimum tool calls
+                if total_tool_calls >= MIN_TOOL_CALLS:
+                    progress("✅ Found it!")
+                    return text
+
+                # Not enough tool calls yet — nudge
+                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "user", "content": (
+                    f"You have only made {total_tool_calls} tool call(s). "
+                    "You must search and read code before answering. "
+                    "Call flowmap_search or another tool to find the answer."
+                )})
+            else:
+                messages.append({"role": "user", "content": (
+                    "You must call a tool to find the answer."
+                )})
 
         return "Reached max steps without a final answer."
 
-    def _execute_tool(self, tool_call: str) -> str:
-        """Parse and execute a tool call."""
+    def _execute_tool_call(self, tc: ToolCall) -> str:
+        """Execute a native tool call."""
         try:
-            # Parse: tool_name(arg1, arg2, key=value)
-            paren_start = tool_call.index("(")
-            paren_end = tool_call.rindex(")")
-            tool_name = tool_call[:paren_start].strip()
-            args_str = tool_call[paren_start + 1:paren_end]
-
-            # Parse arguments
-            kwargs = {}
-            if args_str:
-                for arg in self._parse_args(args_str):
-                    if "=" in arg:
-                        k, v = arg.split("=", 1)
-                        kwargs[k.strip()] = self._coerce(v.strip())
-                    else:
-                        # Positional arg
-                        kwargs["query" if "query" not in kwargs else "repo"] = self._coerce(arg.strip())
-
-            # O(1) routing via pre-built table
-            adapter = self._tool_routes.get(tool_name)
+            adapter = self._tool_routes.get(tc.name)
             if adapter:
-                return adapter.call_tool(tool_name, kwargs)
+                return adapter.call_tool(tc.name, tc.arguments)
 
-            # Handle direct Slack tools
-            if tool_name.startswith("slack_") and self.slack_client:
-                return self._execute_slack_tool(tool_name, kwargs)
+            if tc.name.startswith("slack_") and self.slack_client:
+                return self._execute_slack_tool(tc.name, tc.arguments)
 
-            return f"Unknown tool: {tool_name}"
-
+            return f"Unknown tool: {tc.name}"
         except Exception as e:
             return f"Tool error: {e}"
 
@@ -252,68 +303,6 @@ class Agent:
             channels = self.slack_client.list_channels()
             return "\n".join(f"- #{ch.name} (id: {ch.id})" for ch in channels)
         return f"Unknown Slack tool: {tool_name}"
-
-    def _parse_args(self, args_str: str) -> list[str]:
-        """Simple argument parser that handles quotes."""
-        args = []
-        current = ""
-        in_quote = None
-        for ch in args_str:
-            if ch in ("'", '"') and in_quote is None:
-                in_quote = ch
-            elif ch == in_quote:
-                in_quote = None
-            elif ch == "," and in_quote is None:
-                args.append(current.strip())
-                current = ""
-                continue
-            current += ch
-        if current.strip():
-            args.append(current.strip())
-        return args
-
-    def _coerce(self, value: str):
-        """Coerce string values to appropriate types."""
-        if value == "null":
-            return None
-        if value == "true":
-            return True
-        if value == "false":
-            return False
-        # Strip quotes
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            return value[1:-1]
-        try:
-            return int(value)
-        except ValueError:
-            return value
-
-    def _format_messages(self, messages: list[dict]) -> str:
-        """Format message history into a single prompt."""
-        parts = []
-        for m in messages:
-            parts.append(f"[{m['role'].upper()}]\n{m['content']}")
-        return "\n\n".join(parts)
-
-    def _format_results(self, results: list) -> str:
-        if not results:
-            return "No results found."
-        formatted = []
-        for i, r in enumerate(results):
-            formatted.append(f"[{i+1}] {r.repo}/{r.file} (lines {r.start_line}-{r.end_line})")
-            formatted.append(f"    {r.text[:300]}")
-            if r.signature:
-                formatted.append(f"    Signature: {r.signature}")
-            formatted.append("")
-        return "\n".join(formatted)
-
-    def _format_commits(self, commits: list) -> str:
-        if not commits:
-            return "No commit history available."
-        return "\n".join(
-            f"- [{c.sha[:8]}] {c.date} by {c.author}: {c.message}"
-            for c in commits
-        )
 
     def _format_slack_messages(self, messages: list) -> str:
         """Format Slack messages for display."""

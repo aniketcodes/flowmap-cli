@@ -8,12 +8,50 @@ import pytest
 from unittest.mock import Mock, patch
 from agent.bot import SlackBot
 from agent.agent import Agent
-from agent.server import FlowMapMCPServer
-from agent.llm import LLMClient
+from agent.llm import LLMClient, LLMResponse, ToolCall
+from agent.adapter import MCPAdapter
 
 
-# Shared tool schema for mocks
-_FLOWMAP_TOOLS = FlowMapMCPServer.list_tools(FlowMapMCPServer.__new__(FlowMapMCPServer))
+class MockAdapter(MCPAdapter):
+    def __init__(self, tools, handler=None):
+        self._tools = tools
+        self._handler = handler or (lambda n, a: "result")
+
+    def name(self):
+        return "flowmap"
+
+    def list_tools(self):
+        return self._tools
+
+    def call_tool(self, name, args):
+        return self._handler(name, args)
+
+
+_FLOWMAP_TOOLS = [
+    {"name": "flowmap_search", "description": "Search code", "inputSchema": {
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"]
+    }},
+    {"name": "flowmap_cat", "description": "Read file", "inputSchema": {
+        "properties": {"repo": {"type": "string"}, "file": {"type": "string"}},
+        "required": ["repo", "file"]
+    }},
+    {"name": "flowmap_history", "description": "Git history", "inputSchema": {
+        "properties": {"repo": {"type": "string"}},
+        "required": ["repo"]
+    }},
+    {"name": "flowmap_repos", "description": "List repos", "inputSchema": {
+        "properties": {}, "required": []
+    }},
+    {"name": "flowmap_symbols", "description": "Find symbols", "inputSchema": {
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"]
+    }},
+    {"name": "flowmap_map", "description": "Map a repo", "inputSchema": {
+        "properties": {"repo": {"type": "string"}},
+        "required": ["repo"]
+    }},
+]
 
 
 class TestBotAgentWiring:
@@ -32,50 +70,61 @@ class TestBotAgentWiring:
 
 
 class TestAgentMCPWiring:
-    """Test that Agent calls MCP Server."""
+    """Test that Agent calls MCP tools via adapter."""
 
     def test_agent_wires_to_mcp(self):
-        """Agent calls MCP tools when LLM requests them."""
-        mock_mcp = Mock(spec=FlowMapMCPServer)
-        mock_mcp.list_tools.return_value = _FLOWMAP_TOOLS
-        mock_mcp.search.return_value = []
-        mock_mcp.history.return_value = []
-        mock_mcp.cat.return_value = "1: test code"
-        mock_llm = Mock(spec=LLMClient)
+        """Agent calls adapter tools when LLM requests them."""
+        search_handler = Mock(return_value='[]')
+        cat_handler = Mock(return_value="1: test code")
+
+        adapter = MockAdapter(_FLOWMAP_TOOLS, handler=lambda n, a: (
+            search_handler(n, a) if n == "flowmap_search" else cat_handler(n, a)
+        ))
+
+        mock_llm = Mock()
         mock_llm.chat.side_effect = [
-            Mock(content='TOOL_CALL: flowmap_search(query="test")'),
-            Mock(content='TOOL_CALL: flowmap_cat(repo="test", file="test.ts")'),
-            Mock(content="FINAL_ANSWER: test"),
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc_1", name="flowmap_search", arguments={"query": "test"})
+            ]),
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc_2", name="flowmap_cat", arguments={"repo": "r", "file": "f.ts"})
+            ]),
+            LLMResponse(content="test", tool_calls=None),
         ]
 
-        agent = Agent(mcp=mock_mcp, llm=mock_llm)
+        agent = Agent(adapters=[adapter], llm=mock_llm)
         agent.diagnose("402 errors")
 
-        mock_mcp.search.assert_called_once()
-        mock_mcp.cat.assert_called_once()
+        assert search_handler.call_count == 1
+        assert cat_handler.call_count == 1
 
 
 class TestAgentLLMWiring:
-    """Test that Agent calls LLM."""
+    """Test that Agent calls LLM with tools."""
 
     def test_agent_wires_to_llm(self):
-        """Agent calls LLM.chat with agentic prompt."""
-        mock_llm = Mock(spec=LLMClient)
-        # LLM must read a file before FINAL_ANSWER (cat_calls guard)
-        mock_llm.chat.side_effect = [
-            Mock(content='TOOL_CALL: flowmap_cat(repo="test", file="test.ts")'),
-            Mock(content="FINAL_ANSWER: explanation"),
-        ]
-        mock_mcp = Mock(spec=FlowMapMCPServer)
-        mock_mcp.list_tools.return_value = _FLOWMAP_TOOLS
-        mock_mcp.search.return_value = []
-        mock_mcp.cat.return_value = "1: test code"
+        """Agent calls LLM.chat with tools parameter."""
+        adapter = MockAdapter(_FLOWMAP_TOOLS, handler=lambda n, a: "result")
 
-        agent = Agent(mcp=mock_mcp, llm=mock_llm)
+        mock_llm = Mock()
+        mock_llm.chat.side_effect = [
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc_1", name="flowmap_search", arguments={"query": "402"})
+            ]),
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc_2", name="flowmap_cat", arguments={"repo": "r", "file": "err.ts"})
+            ]),
+            LLMResponse(content="explanation", tool_calls=None),
+        ]
+
+        agent = Agent(adapters=[adapter], llm=mock_llm)
         result = agent.diagnose("402 errors")
 
         assert "explanation" in result
-        mock_llm.chat.assert_called()
+        assert mock_llm.chat.call_count == 3
+        # Verify tools were passed
+        for call in mock_llm.chat.call_args_list:
+            assert "tools" in call.kwargs
 
 
 class TestFullFlow:
@@ -84,29 +133,24 @@ class TestFullFlow:
     def test_full_flow_returns_explanation(self):
         """Complete flow from message to response."""
         bot = SlackBot()
-        agent = Agent()
-        mcp = FlowMapMCPServer()
-        llm = LLMClient(provider="mock")
 
+        adapter = MockAdapter(_FLOWMAP_TOOLS, handler=lambda n, a: "result")
+
+        mock_llm = Mock()
+        mock_llm.chat.side_effect = [
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc_1", name="flowmap_search", arguments={"query": "402"})
+            ]),
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc_2", name="flowmap_cat", arguments={"repo": "r", "file": "pay.ts"})
+            ]),
+            LLMResponse(content="402 errors are caused by rate limiting in pay.ts:42", tool_calls=None),
+        ]
+
+        agent = Agent(adapters=[adapter], llm=mock_llm)
         bot.agent = agent
-        agent.mcp = mcp
-        agent.llm = llm
 
-        # Register the mcp as an adapter for proper routing
-        from agent.flowmap_adapter import FlowMapAdapter
-        agent.adapters = [FlowMapAdapter(server=mcp)]
-        agent._tool_routes = {}
-        for adapter in agent.adapters:
-            for tool in adapter.list_tools():
-                agent._tool_routes[tool["name"]] = adapter
-
-        with patch.object(mcp, 'search') as mock_search:
-            mock_search.return_value = [
-                Mock(file="app.py", score=0.95, text="retry logic removed",
-                     repo="test", start_line=1, end_line=10, signature="retry()")
-            ]
-
-            response = bot.handle_mention("Why 402 errors?")
+        response = bot.handle_mention("Why 402 errors?")
 
         assert response is not None
         assert len(response) > 0

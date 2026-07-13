@@ -26,6 +26,79 @@ def _md_to_slack(text: str) -> str:
     return text.strip()
 
 
+def _md_to_blocks(text: str) -> list:
+    """Convert markdown response to Slack Block Kit blocks for rich formatting."""
+    blocks = []
+    sections = re.split(r"\n\n+", text)
+
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+
+        # Code block
+        if section.startswith("```"):
+            code = re.sub(r"^```\w*\n?", "", section)
+            code = re.sub(r"\n?```$", "", code)
+            blocks.append({
+                "type": "code",
+                "text": {
+                    "type": "plain_text",
+                    "text": code.strip(),
+                },
+            })
+        # Heading (starts with #)
+        elif re.match(r"^#{1,3}\s+", section):
+            heading = re.sub(r"^#{1,3}\s+", "", section)
+            heading = re.sub(r"\*\*(.*?)\*\*", r"\1", heading)
+            blocks.append({
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": heading.strip()[:150],
+                },
+            })
+        # Bullet list
+        elif re.search(r"^[\-\*]\s+", section, re.MULTILINE):
+            lines = section.split("\n")
+            mrkdwn_lines = []
+            for line in lines:
+                line = re.sub(r"^[\-\*]\s+", "• ", line)
+                line = re.sub(r"\*\*(.*?)\*\*", r"*\1*", line)
+                mrkdwn_lines.append(line)
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "\n".join(mrkdwn_lines),
+                },
+            })
+        # Separator line (e.g., "Summary of Flow:")
+        elif re.match(r"^(Summary|Flow|Root Cause|Diagnosis|Cause)", section, re.IGNORECASE):
+            blocks.append({"type": "divider"})
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*{section}*",
+                },
+            })
+        # Regular text
+        else:
+            mrkdwn = re.sub(r"\*\*(.*?)\*\*", r"*\1*", section)
+            mrkdwn = re.sub(r"`([^`]+)`", r"`\1`", mrkdwn)
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": mrkdwn[:3000],
+                },
+            })
+
+    # Ensure we don't exceed Slack's 50-block limit
+    return blocks[:49]
+
+
 class SlackBot:
     """Slack bot that responds to mentions with streaming."""
 
@@ -160,22 +233,24 @@ class SlackBot:
                 response = "Sorry, I encountered an error. Please try again later."
 
             # Build action buttons if planner and registry are available
-            blocks = None
+            action_blocks = None
             if self._action_planner and self._action_registry:
                 actions = self._action_planner.recommend(response)
                 if actions:
                     self._action_registry.store(placeholder_ts, actions, diagnosis=response)
-                    blocks = build_action_blocks(response, actions, placeholder_ts)
+                    action_blocks = build_action_blocks(response, actions, placeholder_ts)
 
-            sm.finish(_md_to_slack(response))
+            # Format response as Block Kit for rich display
+            response_blocks = _md_to_blocks(response)
+            sm.finish(_md_to_slack(response), blocks=response_blocks if response_blocks else None)
 
             # Post action buttons as a separate message (chat_update doesn't support interactive elements)
-            if blocks and self.slack_app:
+            if action_blocks and self.slack_app:
                 try:
                     self.slack_app.client.chat_postMessage(
                         channel=channel,
                         thread_ts=placeholder_ts,
-                        blocks=blocks,
+                        blocks=action_blocks,
                         text="Suggested actions",
                     )
                 except Exception as e:

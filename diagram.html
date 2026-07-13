@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlowMap Agent — Sequence Diagram</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: #fff;
+            color: #1d1d1f;
+        }
+
+        .header {
+            padding: 32px 32px 0;
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: #86868b;
+            margin-bottom: 16px;
+        }
+
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 32px;
+            background: #f5f5f7;
+            border-bottom: 1px solid #d2d2d7;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .controls button {
+            width: 32px;
+            height: 32px;
+            border: 1px solid #d2d2d7;
+            border-radius: 6px;
+            background: #fff;
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #1d1d1f;
+        }
+
+        .controls button:hover {
+            background: #e8e8ed;
+        }
+
+        .controls .zoom-label {
+            font-size: 13px;
+            color: #86868b;
+            min-width: 50px;
+            text-align: center;
+        }
+
+        .controls .hint {
+            font-size: 12px;
+            color: #86868b;
+            margin-left: auto;
+        }
+
+        .diagram-wrapper {
+            overflow: auto;
+            padding: 24px 32px 48px;
+        }
+
+        .diagram-inner {
+            transform-origin: top left;
+            transition: transform 0.15s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Transaction Failure Diagnosis</h1>
+        <p class="subtitle">End-to-end sequence: Slack question → Agent loop → TDD Bugfix PR</p>
+    </div>
+
+    <div class="diagram-wrapper">
+        <div class="diagram-inner" id="diagramInner">
+            <svg viewBox="0 0 1060 1460" style="font-family: 'Inter', -apple-system, sans-serif; width: 100%; height: auto;">
+                <defs>
+                    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                        <path d="M0,0 L8,3 L0,6 Z" fill="#1d1d1f"/>
+                    </marker>
+                    <marker id="arrow-gray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+                        <path d="M0,0 L8,3 L0,6 Z" fill="#86868b"/>
+                    </marker>
+                </defs>
+
+                <!-- Participant boxes -->
+                <rect x="20" y="12" width="72" height="32" rx="6" fill="#e8f0fe" stroke="#a8c7fa" stroke-width="1.5"/>
+                <text x="56" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#1a73e8">Slack</text>
+
+                <rect x="155" y="12" width="72" height="32" rx="6" fill="#e6f4ea" stroke="#a8dab5" stroke-width="1.5"/>
+                <text x="191" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">Bot</text>
+
+                <rect x="290" y="12" width="72" height="32" rx="6" fill="#fef7e0" stroke="#fcd34d" stroke-width="1.5"/>
+                <text x="326" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#b45309">Agent</text>
+
+                <rect x="425" y="12" width="72" height="32" rx="6" fill="#fce8e6" stroke="#f5a8a0" stroke-width="1.5"/>
+                <text x="461" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#d93025">LLM</text>
+
+                <rect x="560" y="12" width="90" height="32" rx="6" fill="#e0e7ff" stroke="#a5b4fc" stroke-width="1.5"/>
+                <text x="605" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#4f46e5">Slack MCP</text>
+
+                <rect x="710" y="12" width="72" height="32" rx="6" fill="#fee2e2" stroke="#fca5a5" stroke-width="1.5"/>
+                <text x="746" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#dc2626">Grafana</text>
+
+                <rect x="840" y="12" width="72" height="32" rx="6" fill="#f3e8fd" stroke="#c084fc" stroke-width="1.5"/>
+                <text x="876" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#7c3aed">FlowMap</text>
+
+                <rect x="970" y="12" width="72" height="32" rx="6" fill="#e0f2fe" stroke="#7dd3fc" stroke-width="1.5"/>
+                <text x="1006" y="33" text-anchor="middle" font-size="11" font-weight="600" fill="#0284c7">GitHub</text>
+
+                <!-- Lifelines -->
+                <line x1="56" y1="44" x2="56" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="191" y1="44" x2="191" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="326" y1="44" x2="326" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="461" y1="44" x2="461" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="605" y1="44" x2="605" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="746" y1="44" x2="746" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="876" y1="44" x2="876" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+                <line x1="1006" y1="44" x2="1006" y2="1420" stroke="#d2d2d7" stroke-width="1" stroke-dasharray="5,3"/>
+
+                <!-- ==================== Section 1: Message Reception ==================== -->
+                <rect x="10" y="58" width="1040" height="86" fill="#f5f5f7" rx="4" opacity="0.6"/>
+                <text x="24" y="78" font-size="10" font-weight="600" fill="#86868b" letter-spacing="0.8">① MESSAGE RECEPTION + THREAD CONTEXT</text>
+
+                <line x1="56" y1="100" x2="183" y2="100" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="119" y="93" text-anchor="middle" font-size="11" fill="#1d1d1f">@FlowMap Agent why is txn ...0544 not found?</text>
+
+                <line x1="191" y1="120" x2="597" y2="120" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="394" y="113" text-anchor="middle" font-size="11" fill="#1d1d1f">conversations_history(channel, thread_ts)</text>
+
+                <line x1="597" y1="138" x2="199" y2="138" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="398" y="132" text-anchor="middle" font-size="10" fill="#86868b">[{user: "...", text: "payment failed for ..."}, ...]</text>
+
+                <!-- ==================== Section 2: Agent Loop ==================== -->
+                <rect x="10" y="158" width="1040" height="455" fill="#fef7e0" rx="4" opacity="0.08"/>
+                <text x="24" y="178" font-size="10" font-weight="600" fill="#f59e0b" letter-spacing="0.8">② AGENT LOOP (LLM decides tool calls)</text>
+
+                <line x1="191" y1="195" x2="318" y2="195" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="255" y="188" text-anchor="middle" font-size="11" fill="#1d1d1f">diagnose(msg, thread_history)</text>
+
+                <rect x="270" y="210" width="760" height="390" fill="none" stroke="#fcd34d" stroke-width="1" stroke-dasharray="4,3" rx="6"/>
+                <text x="280" y="226" font-size="9" font-weight="600" fill="#f59e0b" letter-spacing="0.5">LOOP</text>
+
+                <line x1="326" y1="245" x2="453" y2="245" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="390" y="238" text-anchor="middle" font-size="11" fill="#1d1d1f">"What tools should I call?"</text>
+
+                <line x1="453" y1="270" x2="334" y2="270" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="394" y="263" text-anchor="middle" font-size="10" fill="#86868b" font-family="monospace">grafana_query_loki</text>
+
+                <line x1="326" y1="300" x2="738" y2="300" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="532" y="293" text-anchor="middle" font-size="11" fill="#1d1d1f">{"job="demo-services"} |= "334664236896620544"</text>
+
+                <line x1="738" y1="330" x2="334" y2="330" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="536" y="323" text-anchor="middle" font-size="10" fill="#86868b">payment: ...0544 | order: ...0540</text>
+
+                <line x1="326" y1="360" x2="453" y2="360" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="390" y="353" text-anchor="middle" font-size="11" fill="#1d1d1f">"IDs differ — search order.ts"</text>
+
+                <line x1="453" y1="385" x2="334" y2="385" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="394" y="378" text-anchor="middle" font-size="10" fill="#86868b" font-family="monospace">flowmap_search</text>
+
+                <line x1="326" y1="415" x2="868" y2="415" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="597" y="408" text-anchor="middle" font-size="11" fill="#1d1d1f">search("order.ts precision loss")</text>
+
+                <line x1="868" y1="445" x2="334" y2="445" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="601" y="438" text-anchor="middle" font-size="10" fill="#86868b">src/order.ts:65 — req.body.transaction_id</text>
+
+                <line x1="326" y1="475" x2="868" y2="475" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="597" y="468" text-anchor="middle" font-size="11" fill="#1d1d1f">cat("src/order.ts", lines 60-70)</text>
+
+                <line x1="868" y1="505" x2="334" y2="505" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="601" y="498" text-anchor="middle" font-size="10" fill="#86868b">const txnId = req.body.transaction_id</text>
+
+                <line x1="326" y1="535" x2="453" y2="535" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="390" y="528" text-anchor="middle" font-size="11" fill="#1d1d1f">"Evidence + thread context. Diagnose."</text>
+
+                <line x1="453" y1="565" x2="334" y2="565" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="394" y="558" text-anchor="middle" font-size="10" fill="#86868b">IEEE 754 at order.ts:65</text>
+
+                <rect x="470" y="550" width="180" height="24" fill="#fef7e0" stroke="#fcd34d" stroke-width="1" rx="4"/>
+                <text x="560" y="566" text-anchor="middle" font-size="9" fill="#b45309">thread context confirms pattern</text>
+
+                <!-- ==================== Section 3: Diagnosis ==================== -->
+                <rect x="10" y="616" width="1040" height="68" fill="#e6f4ea" rx="4" opacity="0.15"/>
+                <text x="24" y="636" font-size="10" font-weight="600" fill="#137333" letter-spacing="0.8">③ DIAGNOSIS</text>
+
+                <line x1="318" y1="660" x2="199" y2="660" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="259" y="654" text-anchor="middle" font-size="10" fill="#86868b">diagnosis complete</text>
+
+                <line x1="183" y1="676" x2="64" y2="676" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="124" y="670" text-anchor="middle" font-size="10" fill="#86868b">"Root cause: order.ts:65" + [Create Bugfix PR]</text>
+
+                <!-- ==================== Section 4: TDD Bugfix PR ==================== -->
+                <rect x="10" y="698" width="1040" height="760" fill="#f3e8fd" rx="4" opacity="0.08"/>
+                <text x="24" y="718" font-size="10" font-weight="600" fill="#7c3aed" letter-spacing="0.8">④ TDD BUGFIX PR (user clicks "Create Bugfix PR")</text>
+
+                <line x1="56" y1="743" x2="183" y2="743" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="119" y="736" text-anchor="middle" font-size="11" fill="#1d1d1f">clicks "Create Bugfix PR"</text>
+
+                <line x1="191" y1="773" x2="318" y2="773" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="255" y="766" text-anchor="middle" font-size="11" fill="#1d1d1f">create_bugfix_pr(diagnosis, thread_history)</text>
+
+                <line x1="326" y1="803" x2="868" y2="803" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="597" y="796" text-anchor="middle" font-size="11" fill="#1d1d1f">search + read source files</text>
+
+                <line x1="868" y1="828" x2="334" y2="828" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="601" y="821" text-anchor="middle" font-size="10" fill="#86868b">order.ts + EXPORTS: {httpClient, setHttpClient, createOrderRouter}</text>
+
+                <line x1="326" y1="855" x2="597" y2="855" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="462" y="848" text-anchor="middle" font-size="11" fill="#1d1d1f">conversations_history(thread)</text>
+
+                <line x1="597" y1="880" x2="334" y2="880" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="466" y="873" text-anchor="middle" font-size="10" fill="#86868b">thread messages for test context</text>
+
+                <!-- RED phase bracket -->
+                <rect x="270" y="900" width="760" height="140" fill="none" stroke="#ef4444" stroke-width="1" stroke-dasharray="4,3" rx="6"/>
+                <text x="280" y="916" font-size="9" font-weight="600" fill="#ef4444" letter-spacing="0.5">RED PHASE</text>
+
+                <line x1="326" y1="935" x2="453" y2="935" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="390" y="928" text-anchor="middle" font-size="11" fill="#1d1d1f">"Generate failing test" + exports + thread</text>
+
+                <line x1="453" y1="965" x2="334" y2="965" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="394" y="958" text-anchor="middle" font-size="10" fill="#86868b">test: expect(txnId).toBe(largeNumber)</text>
+
+                <rect x="340" y="990" width="120" height="24" fill="#ef4444" stroke="#dc2626" stroke-width="1" rx="4"/>
+                <text x="400" y="1006" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">npx jest → FAIL</text>
+
+                <!-- GREEN phase bracket -->
+                <rect x="270" y="1070" width="760" height="215" fill="none" stroke="#22c55e" stroke-width="1" stroke-dasharray="4,3" rx="6"/>
+                <text x="280" y="1086" font-size="9" font-weight="600" fill="#22c55e" letter-spacing="0.5">GREEN PHASE</text>
+
+                <line x1="326" y1="1115" x2="453" y2="1115" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="390" y="1108" text-anchor="middle" font-size="11" fill="#1d1d1f">"Generate fix" + thread context</text>
+
+                <line x1="453" y1="1145" x2="334" y2="1145" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="394" y="1138" text-anchor="middle" font-size="10" fill="#86868b">String(req.body.transaction_id)</text>
+
+                <rect x="340" y="1170" width="150" height="24" fill="#f5f5f7" stroke="#d2d2d7" stroke-width="1" rx="4"/>
+                <text x="415" y="1186" text-anchor="middle" font-size="10" fill="#86868b">tsc --noEmit → OK</text>
+
+                <rect x="340" y="1210" width="120" height="24" fill="#22c55e" stroke="#16a34a" stroke-width="1" rx="4"/>
+                <text x="400" y="1226" text-anchor="middle" font-size="10" font-weight="600" fill="#fff">npx jest → PASS</text>
+
+                <line x1="326" y1="1260" x2="998" y2="1260" stroke="#1d1d1f" stroke-width="1.5" marker-end="url(#arrow)"/>
+                <text x="662" y="1253" text-anchor="middle" font-size="11" fill="#1d1d1f">branch → commit → push (test + fix)</text>
+
+                <line x1="998" y1="1290" x2="334" y2="1290" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="666" y="1283" text-anchor="middle" font-size="10" fill="#86868b">github.com/.../compare/...</text>
+
+                <line x1="183" y1="1335" x2="64" y2="1335" stroke="#86868b" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-gray)"/>
+                <text x="124" y="1329" text-anchor="middle" font-size="10" fill="#86868b">"PR created with test + fix"</text>
+
+                <!-- PR contents callout -->
+                <rect x="200" y="1355" width="600" height="60" fill="#f5f5f7" stroke="#d2d2d7" stroke-width="1" rx="8"/>
+                <text x="500" y="1373" text-anchor="middle" font-size="11" font-weight="600" fill="#1d1d1f">PR includes:</text>
+                <text x="500" y="1393" text-anchor="middle" font-size="10" fill="#86868b">tests/bugfix.test.ts (new) — demonstrates precision loss with large IDs</text>
+                <text x="500" y="1407" text-anchor="middle" font-size="10" fill="#86868b">src/order.ts (fix) — String(req.body.transaction_id) prevents rounding</text>
+            </svg>
+        </div>
+    </div>
+
+    <script>
+        let scale = 1;
+        const inner = document.getElementById('diagramInner');
+        const label = document.getElementById('zoomLabel');
+
+        function zoom(delta) {
+            scale = Math.max(0.3, Math.min(2, scale + delta));
+            inner.style.transform = `scale(${scale})`;
+            label.textContent = Math.round(scale * 100) + '%';
+        }
+
+        function resetZoom() {
+            scale = 1;
+            inner.style.transform = 'scale(1)';
+            label.textContent = '100%';
+        }
+
+        function fitWidth() {
+            const wrapper = document.querySelector('.diagram-wrapper');
+            const svgWidth = 1060;
+            scale = (wrapper.clientWidth - 64) / svgWidth;
+            inner.style.transform = `scale(${scale})`;
+            label.textContent = Math.round(scale * 100) + '%';
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === '=' || e.key === '+') zoom(0.1);
+            if (e.key === '-') zoom(-0.1);
+            if (e.key === '0') resetZoom();
+        });
+    </script>
+</body>
+</html>

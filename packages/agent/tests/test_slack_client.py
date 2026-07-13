@@ -144,18 +144,14 @@ class TestAgentSlackIntegration:
     def test_agent_can_call_slack_history_tool(self):
         """Agent can call slack_history tool to get channel messages."""
         from agent.agent import Agent
+        from agent.llm import LLMResponse, ToolCall
         from agent.slack_client import SlackClient
         from agent.server import FlowMapMCPServer
-        
+
         # Arrange
         mock_mcp = Mock()
         mock_mcp.list_tools.return_value = FlowMapMCPServer.list_tools(FlowMapMCPServer.__new__(FlowMapMCPServer))
-        
-        mock_llm = Mock()
-        mock_response = Mock()
-        mock_response.content = "FINAL_ANSWER: I searched the code but found no relevant results."
-        mock_llm.chat.return_value = mock_response
-        
+
         mock_app = Mock()
         mock_app.client.conversations_history.return_value = {
             "ok": True,
@@ -163,37 +159,51 @@ class TestAgentSlackIntegration:
                 {"ts": "123", "user": "U1", "text": "Payment 402 errors in prod", "channel": "C1"}
             ]
         }
-        
+
         slack_client = SlackClient(app=mock_app)
+        mock_llm = Mock()
+
+        # LLM makes 2 tool calls then returns text (satisfies MIN_TOOL_CALLS=2)
+        mock_llm.chat.side_effect = [
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc1", name="flowmap_search", arguments={"query": "402 error"}),
+            ]),
+            LLMResponse(content="", tool_calls=[
+                ToolCall(id="tc2", name="slack_history", arguments={"channel_id": "C1", "limit": 10}),
+            ]),
+            LLMResponse(content="Found payment 402 errors in Slack channel.", tool_calls=None),
+        ]
+
         agent = Agent(mcp=mock_mcp, llm=mock_llm, slack_client=slack_client)
-        
+
         # Act
         result = agent.diagnose("Why are we getting 402 errors?")
-        
+
         # Assert
         assert result is not None
         assert len(result) > 0
+        assert "payment 402" in result.lower() or "402" in result
 
     def test_agent_tool_definitions_include_slack_tools(self):
         """Agent includes slack tools in its tool definitions."""
         from agent.agent import Agent
         from agent.slack_client import SlackClient
         from agent.server import FlowMapMCPServer
-        
+
         # Arrange
         mock_mcp = Mock()
         mock_mcp.list_tools.return_value = FlowMapMCPServer.list_tools(FlowMapMCPServer.__new__(FlowMapMCPServer))
-        
+
         mock_llm = Mock()
         mock_app = Mock()
         slack_client = SlackClient(app=mock_app)
-        
+
         agent = Agent(mcp=mock_mcp, llm=mock_llm, slack_client=slack_client)
-        
+
         # Act
-        tool_defs = agent._get_tool_definitions()
-        tool_names = [t["name"] for t in tool_defs]
-        
+        tool_defs = agent._build_openai_tools()
+        tool_names = [t["function"]["name"] for t in tool_defs if t.get("type") == "function"]
+
         # Assert
         assert "slack_history" in tool_names
         assert "slack_search" in tool_names
@@ -255,27 +265,35 @@ class TestSlackMCPClient:
         from agent.agent import Agent
         from agent.slack_adapter import SlackAdapter
         from agent.server import FlowMapMCPServer
-        
+
         # Arrange - use adapters directly
         flowmap_adapter = Mock()
         flowmap_adapter.name.return_value = "flowmap"
         flowmap_adapter.list_tools.return_value = FlowMapMCPServer.list_tools(FlowMapMCPServer.__new__(FlowMapMCPServer))
-        
+
         slack_adapter = Mock()
         slack_adapter.name.return_value = "slack"
         slack_adapter.list_tools.return_value = [
-            {"name": "slack_conversations_history", "description": "Get channel history"},
-            {"name": "slack_conversations_search_messages", "description": "Search messages"},
+            {
+                "name": "slack_conversations_history",
+                "description": "Get channel history",
+                "inputSchema": {"type": "object", "properties": {"channel_id": {"type": "string"}}, "required": ["channel_id"]},
+            },
+            {
+                "name": "slack_conversations_search_messages",
+                "description": "Search messages",
+                "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            },
         ]
-        
+
         mock_llm = Mock()
-        
+
         agent = Agent(adapters=[flowmap_adapter, slack_adapter], llm=mock_llm)
-        
+
         # Act
-        tool_defs = agent._get_tool_definitions()
-        tool_names = [t["name"] for t in tool_defs]
-        
+        tool_defs = agent._build_openai_tools()
+        tool_names = [t["function"]["name"] for t in tool_defs if t.get("type") == "function"]
+
         # Assert
         assert "slack_conversations_history" in tool_names
         assert "slack_conversations_search_messages" in tool_names

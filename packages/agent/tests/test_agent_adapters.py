@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import Mock
 from agent.agent import Agent
 from agent.adapter import MCPAdapter
+from agent.llm import LLMResponse, ToolCall
 
 
 class MockAdapter(MCPAdapter):
@@ -48,8 +49,8 @@ class TestAgentAdapters:
         assert agent._tool_routes["flowmap_search"] is adapter1
         assert agent._tool_routes["slack_history"] is adapter2
 
-    def test_agent_build_tool_prompt_dynamically(self):
-        """Agent generates tool prompt from adapters, not hardcoded string."""
+    def test_agent_build_openai_tools_dynamically(self):
+        """Agent generates OpenAI-format tool definitions from adapters."""
         adapter = MockAdapter("flowmap", [
             {"name": "flowmap_search", "description": "Search code", "inputSchema": {
                 "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
@@ -58,14 +59,17 @@ class TestAgentAdapters:
         ])
 
         agent = Agent(adapters=[adapter], llm=Mock())
-        prompt = agent._build_tool_prompt()
+        tools = agent._build_openai_tools()
 
-        assert "flowmap_search" in prompt
-        assert "Search code" in prompt
-        assert "query" in prompt
+        assert len(tools) == 1
+        assert tools[0]["type"] == "function"
+        assert tools[0]["function"]["name"] == "flowmap_search"
+        assert tools[0]["function"]["description"] == "Search code"
+        assert "query" in tools[0]["function"]["parameters"]["properties"]
+        assert tools[0]["function"]["parameters"]["required"] == ["query"]
 
-    def test_agent_execute_tool_routes_to_correct_adapter(self):
-        """Agent routes tool call to correct adapter via routing table."""
+    def test_agent_execute_tool_call_routes_to_correct_adapter(self):
+        """Agent routes ToolCall to correct adapter via routing table."""
         flowmap_handler = Mock(return_value="FlowMap result")
         slack_handler = Mock(return_value="Slack result")
 
@@ -81,13 +85,15 @@ class TestAgentAdapters:
         agent = Agent(adapters=[adapter1, adapter2], llm=Mock())
 
         # Test routing to flowmap
-        result = agent._execute_tool("flowmap_search(query='test')")
+        tc = ToolCall(id="tc_1", name="flowmap_search", arguments={"query": "test"})
+        result = agent._execute_tool_call(tc)
         flowmap_handler.assert_called_once()
         assert result == "FlowMap result"
 
-        # Reset and test routing to slack
+        # Test routing to slack
         flowmap_handler.reset_mock()
-        result = agent._execute_tool("slack_history(channel='C123')")
+        tc2 = ToolCall(id="tc_2", name="slack_history", arguments={"channel_id": "C123"})
+        result = agent._execute_tool_call(tc2)
         slack_handler.assert_called_once()
         assert result == "Slack result"
 
@@ -96,18 +102,22 @@ class TestAgentAdapters:
         adapter = MockAdapter("test", [{"name": "test_tool", "description": "Test"}])
         agent = Agent(adapters=[adapter], llm=Mock())
 
-        result = agent._execute_tool("unknown_tool()")
+        tc = ToolCall(id="tc_1", name="unknown_tool", arguments={})
+        result = agent._execute_tool_call(tc)
         assert "Unknown tool" in result
 
     def test_agent_backward_compatible_with_mcp_param(self):
         """Agent still works with old mcp= parameter for migration."""
         mock_mcp = Mock()
         mock_mcp.list_tools.return_value = [
-            {"name": "flowmap_search", "description": "Search"}
+            {"name": "flowmap_search", "description": "Search", "inputSchema": {
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }}
         ]
 
         agent = Agent(mcp=mock_mcp, llm=Mock())
-        prompt = agent._build_tool_prompt()
+        tools = agent._build_openai_tools()
 
-        assert "flowmap_search" in prompt
-        assert "Search" in prompt
+        assert len(tools) == 1
+        assert tools[0]["function"]["name"] == "flowmap_search"
