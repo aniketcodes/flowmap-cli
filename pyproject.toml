@@ -26,6 +26,7 @@ dependencies = [
     "tree-sitter-java>=0.23.5",
     "tree-sitter-json>=0.24.8",
     "tree-sitter-swift>=0.0.1",
+    "tree-sitter-rust>=0.24.2",
 ]
 
 [project.optional-dependencies]
