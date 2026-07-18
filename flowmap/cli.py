@@ -583,7 +583,7 @@ def repo_map(ctx, repo, fmt):
 @main.command()
 @click.argument("query", required=False, default=None)
 @click.option("--repo", default=None, help="Filter by repo name")
-@click.option("--type", "kind", default=None, type=click.Choice(["class", "function", "method", "property"]), help="Filter by symbol type")
+@click.option("--type", "kind", default=None, type=click.Choice(["class", "function", "method", "method_default", "property"]), help="Filter by symbol type")
 @click.option("--limit", default=50, help="Max results")
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.pass_context

@@ -24,7 +24,7 @@ FALLBACK_OVERLAP = 20
 @dataclass
 class Chunk:
     text: str
-    chunk_type: str         # function | class | method | preamble | config_block | fallback
+    chunk_type: str         # function | class | method | method_default | property | preamble | config_block | fallback
     symbol_name: str        # "MyClass.my_method" or ""
     signature: str          # "def foo(x: int) -> str" or ""
     parent_symbol: str      # enclosing class name or ""
@@ -75,6 +75,18 @@ _CODE_NODE_TYPES: dict[str, set[str]] = {
         "function_declaration",
         "class_declaration",      # covers class, struct, enum, extension
         "protocol_declaration",
+    },
+    "rust": {
+        "function_item",          # free fn (impl methods are extracted via impl_item)
+        "struct_item",
+        "enum_item",
+        "trait_item",
+        "impl_item",
+        "type_item",
+        "const_item",
+        "static_item",
+        "mod_item",               # recursed into to extract nested items
+        "macro_definition",       # macro_rules! definitions
     },
 }
 
@@ -210,13 +222,46 @@ def _chunk_code(content: str, language: str, parser) -> list[Chunk]:
     tree = parser.parse(content_bytes)
     root = tree.root_node
 
-    code_types = _CODE_NODE_TYPES.get(language, set())
-    decorated_type = _DECORATED_WRAPPER_TYPES.get(language)
-
     chunks: list[Chunk] = []
     extracted_ranges: list[tuple[int, int]] = []  # (start_byte, end_byte) of extracted nodes
 
-    for child in root.children:
+    _chunk_code_scope(
+        root, content_bytes, language,
+        parent_path="", parent_signature="",
+        chunks=chunks, extracted_ranges=extracted_ranges,
+    )
+
+    # Collect preamble — all top-level text NOT inside extracted nodes
+    preamble = _extract_preamble(content_bytes, extracted_ranges, language)
+    if preamble:
+        # Split large preambles
+        if len(preamble.text) > MAX_CHUNK_CHARS:
+            chunks.extend(_split_preamble(preamble))
+        else:
+            chunks.append(preamble)
+
+    return chunks
+
+
+def _chunk_code_scope(
+    parent_node: Node,
+    content_bytes: bytes,
+    language: str,
+    parent_path: str,
+    parent_signature: str,
+    chunks: list[Chunk],
+    extracted_ranges: list[tuple[int, int]],
+) -> None:
+    """Recursively process a node's children, emitting chunks and recursing into Rust `mod_item`.
+
+    `parent_path` is the dotted path of enclosing Rust mod items (e.g. "outer" or
+    "outer.nested"). Items found here get their `symbol_name` prefixed with this path
+    (so a fn `inner_fn` inside `mod outer` becomes `outer.inner_fn`).
+    """
+    code_types = _CODE_NODE_TYPES.get(language, set())
+    decorated_type = _DECORATED_WRAPPER_TYPES.get(language)
+
+    for child in parent_node.children:
         node_type = child.type
 
         # CommonJS exports (JS/TS only) — handled before code_types gate
@@ -234,7 +279,68 @@ def _chunk_code(content: str, language: str, parser) -> list[Chunk]:
         if node_type not in code_types:
             continue
 
+        # Rust mod_item — recurse into its body with updated parent_path.
+        # For `mod foo;` (no body, external mod declaration), emit a chunk
+        # for the mod itself so users can search for the mod name.
+        if node_type == "mod_item" and language == "rust":
+            mod_name_node = child.child_by_field_name("name")
+            if mod_name_node is not None:
+                mod_name = content_bytes[mod_name_node.start_byte:mod_name_node.end_byte].decode("utf-8", errors="replace")
+                new_path = f"{parent_path}.{mod_name}" if parent_path else mod_name
+                # Capture the mod's signature line for parent context inside
+                mod_first_line = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace").split("\n", 1)[0].rstrip()
+                if len(mod_first_line) > 200:
+                    mod_first_line = mod_first_line[:200] + "..."
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    _chunk_code_scope(
+                        body, content_bytes, language,
+                        parent_path=new_path, parent_signature=mod_first_line,
+                        chunks=chunks, extracted_ranges=extracted_ranges,
+                    )
+                else:
+                    # `mod foo;` — no body, just a forward declaration. Emit
+                    # a chunk for the mod itself.
+                    mod_text = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+                    chunks.append(Chunk(
+                        text=mod_text,
+                        chunk_type="class",
+                        symbol_name=mod_name,
+                        signature=mod_text.rstrip(),
+                        parent_symbol=parent_path,
+                        parent_signature=parent_signature,
+                        start_line=child.start_point[0] + 1,
+                        end_line=child.end_point[0] + 1,
+                        language=language,
+                    ))
+            # Always mark the mod range as extracted so its body doesn't appear in preamble
+            extracted_ranges.append((child.start_byte, child.end_byte))
+            continue
+
         inner = None  # track inner definition for export/decorated nodes
+
+        # Handle Rust impl blocks — emit per-method chunks with qualified names,
+        # mark the whole impl range as extracted (no chunk for the impl itself).
+        if node_type == "impl_item" and language == "rust":
+            impl_chunks = _chunk_rust_impl(child, content_bytes, language, parent_path=parent_path)
+            chunks.extend(impl_chunks)
+            extracted_ranges.append((child.start_byte, child.end_byte))
+            continue
+
+        # Handle Rust trait declarations — emit per-method chunks for required
+        # and default methods. The trait itself is still emitted as a class
+        # chunk via the default branch, but we strip its body so we don't
+        # duplicate the method bodies (which are already in the per-method
+        # chunks). The trait's signature includes attributes, generics, and
+        # super-traits — anything up to the opening `{`.
+        if node_type == "trait_item" and language == "rust":
+            trait_chunks = _chunk_rust_trait(child, content_bytes, language, parent_path=parent_path)
+            chunks.extend(trait_chunks)
+            # Replace the default text with signature-only text after the
+            # default branch builds the chunk. Stash a flag for that branch.
+            _suppress_trait_body = True  # used by code below
+        else:
+            _suppress_trait_body = False
 
         # Handle decorated definitions — extract the outer node, skip inner
         if decorated_type and node_type == decorated_type:
@@ -252,6 +358,54 @@ def _chunk_code(content: str, language: str, parser) -> list[Chunk]:
         else:
             chunk = _node_to_chunk(child, content_bytes, language)
 
+        # Prefix the symbol with the enclosing mod path (Rust only).
+        if chunk and parent_path and language == "rust":
+            chunk.symbol_name = f"{parent_path}.{chunk.symbol_name}"
+            if not chunk.parent_symbol:
+                chunk.parent_symbol = parent_path
+            if not chunk.parent_signature:
+                chunk.parent_signature = parent_signature
+
+        # For Rust items, attach preceding doc comments and `#[..]` attributes
+        # to the chunk text so they're not stranded in the preamble.
+        if chunk and language == "rust" and node_type != "impl_item":
+            trivia_text, trivia_start, trivia_end = _collect_rust_preceding_trivia(child, content_bytes)
+            if trivia_text:
+                chunk.text = trivia_text + chunk.text
+                chunk.start_line = content_bytes[:trivia_start].count(b"\n") + 1
+                # Extend the extracted range backward to cover the trivia so
+                # it doesn't end up in the preamble.
+                extracted_byte_start = trivia_start
+            else:
+                extracted_byte_start = child.start_byte
+        else:
+            extracted_byte_start = child.start_byte
+
+        # For Rust trait declarations, strip the body from the class chunk so
+        # we don't duplicate content that's already in per-method chunks.
+        # Keeps the trait signature line (which may include attributes and
+        # super-traits), the opening `{`, and the closing `}`.
+        if chunk and _suppress_trait_body and node_type == "trait_item":
+            body = child.child_by_field_name("body")
+            if body is not None:
+                # The declaration_list body node starts AT the opening `{`
+                # (the brace is its first child, not part of its name range).
+                # We want: signature line + `{` + `}` — keeps the trait
+                # header visible but drops the method bodies (which are in
+                # per-method chunks already).
+                #
+                # `extracted_byte_start` already includes any preceding
+                # `///` doc comments and `#[..]` attributes (trivia) that
+                # were prepended to the chunk. The default branch above
+                # also wrote `trivia_text` into `chunk.text` directly, so
+                # we must NOT prepend it again here — just rebuild from
+                # `extracted_byte_start` to `body.start_byte` (which is
+                # everything up to but not including the opening `{`).
+                sig_with_trivia = content_bytes[extracted_byte_start:body.start_byte].decode("utf-8", errors="replace")
+                opening_brace = content_bytes[body.start_byte:body.start_byte + 1].decode("utf-8", errors="replace")
+                closing_brace = content_bytes[body.end_byte - 1:body.end_byte].decode("utf-8", errors="replace")
+                chunk.text = sig_with_trivia + opening_brace + closing_brace
+
         if chunk:
             # Split large classes into per-method chunks
             if chunk.chunk_type == "class" and len(chunk.text) > MAX_CHUNK_CHARS:
@@ -265,22 +419,11 @@ def _chunk_code(content: str, language: str, parser) -> list[Chunk]:
                 method_chunks = _split_class(split_node, content_bytes, language)
                 if method_chunks:
                     chunks.extend(method_chunks)
-                    extracted_ranges.append((child.start_byte, child.end_byte))
+                    extracted_ranges.append((extracted_byte_start, child.end_byte))
                     continue
 
             chunks.append(chunk)
-            extracted_ranges.append((child.start_byte, child.end_byte))
-
-    # Collect preamble — all top-level text NOT inside extracted nodes
-    preamble = _extract_preamble(content_bytes, extracted_ranges, language)
-    if preamble:
-        # Split large preambles
-        if len(preamble.text) > MAX_CHUNK_CHARS:
-            chunks.extend(_split_preamble(preamble))
-        else:
-            chunks.append(preamble)
-
-    return chunks
+            extracted_ranges.append((extracted_byte_start, child.end_byte))
 
 
 def _node_to_chunk(
@@ -338,6 +481,14 @@ def _extract_symbol_info(node: Node, content_bytes: bytes, language: str) -> tup
         "property_signature": "property",
         "field_declaration": "property",
         "protocol_declaration": "class",
+        "function_item": "function",
+        "struct_item": "class",
+        "enum_item": "class",
+        "trait_item": "class",
+        "type_item": "class",
+        "const_item": "property",
+        "static_item": "property",
+        "macro_definition": "function",
         "init_declaration": "method",
         "deinit_declaration": "method",
         "subscript_declaration": "method",
@@ -380,6 +531,287 @@ def _extract_go_receiver_type(receiver_node: Node, content_bytes: bytes) -> str:
                 type_text = content_bytes[type_node.start_byte:type_node.end_byte].decode("utf-8", errors="replace")
                 return type_text.lstrip("*")
     return ""
+
+
+def _rust_base_identifier(type_node: Node, content_bytes: bytes) -> str:
+    """Extract the base type name from a Rust type expression.
+
+    `Container<T>` (generic_type)  -> "Container"
+    `fmt::Display` (scoped_type_identifier) -> "Display"
+    `OrderError` (type_identifier) -> "OrderError"
+    """
+    if type_node is None:
+        return ""
+    if type_node.type == "type_identifier":
+        return content_bytes[type_node.start_byte:type_node.end_byte].decode("utf-8", errors="replace")
+    if type_node.type == "scoped_type_identifier":
+        # Take the rightmost type_identifier child (the actual name)
+        last_name = ""
+        for child in type_node.children:
+            if child.type == "type_identifier":
+                last_name = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        return last_name
+    if type_node.type == "generic_type":
+        # The inner type is the first child (skips `<...>` and any trait bounds)
+        for child in type_node.children:
+            if child.type in ("type_identifier", "scoped_type_identifier", "generic_type"):
+                return _rust_base_identifier(child, content_bytes)
+    # Fallback: raw text (shouldn't normally hit)
+    return content_bytes[type_node.start_byte:type_node.end_byte].decode("utf-8", errors="replace")
+
+
+def _collect_rust_preceding_trivia(node: Node, content_bytes: bytes) -> tuple[str, int, int]:
+    """Walk backward through `node`'s preceding siblings, collecting doc comments
+    (`///` / `//!`) and `#[...]` attributes that are immediately above it
+    (no blank line gap).
+
+    Returns (trivia_text, trivia_start_byte, trivia_end_byte). If no trivia,
+    returns ("", node.start_byte, node.start_byte).
+    """
+    parent = node.parent
+    if parent is None:
+        return "", node.start_byte, node.start_byte
+
+    siblings = parent.children
+    # Find this node's index
+    idx = None
+    for i, sib in enumerate(siblings):
+        if sib.start_byte == node.start_byte and sib.end_byte == node.end_byte:
+            idx = i
+            break
+    if idx is None:
+        return "", node.start_byte, node.start_byte
+
+    trivia_nodes: list[Node] = []
+    # "No blank line gap" means the next thing's text is on the line directly
+    # after the trivia's text. The trivia's text starts on its `start_point[0]`
+    # row; the next thing must be on `start_point[0] + 1`. This works for both
+    # `line_comment` (which includes its trailing newline) and `attribute_item`
+    # (which does not).
+    next_text_line = node.start_point[0]
+    for i in range(idx - 1, -1, -1):
+        sib = siblings[i]
+        # Determine eligibility:
+        # - `attribute_item` always qualifies
+        # - `line_comment` qualifies only if it has a `doc_comment` child
+        #   AND uses an OUTER doc marker (`///`); inner doc comments (`//!`)
+        #   document the enclosing module, not the next item, so exclude them.
+        if sib.type == "line_comment" and any(c.type == "doc_comment" for c in sib.children):
+            is_outer_doc = any(c.type == "outer_doc_comment_marker" for c in sib.children)
+            is_qualified_trivia = is_outer_doc
+        elif sib.type == "attribute_item":
+            is_qualified_trivia = True
+        else:
+            is_qualified_trivia = False
+        if not is_qualified_trivia:
+            break
+        if next_text_line != sib.start_point[0] + 1:
+            break  # blank line gap (or worse) — don't attach
+        trivia_nodes.append(sib)
+        next_text_line = sib.start_point[0]
+
+    if not trivia_nodes:
+        return "", node.start_byte, node.start_byte
+
+    trivia_nodes.reverse()  # restore source order
+    # For each trivia node, include the bytes up to the next sibling's start
+    # (or the item's start for the last one). This preserves the trailing
+    # whitespace/newline that tree-sitter excludes for `attribute_item` (which
+    # doesn't end with `\n` in the node range).
+    parts: list[str] = []
+    for i, tn in enumerate(trivia_nodes):
+        if i + 1 < len(trivia_nodes):
+            end = trivia_nodes[i + 1].start_byte
+        else:
+            end = node.start_byte
+        parts.append(content_bytes[tn.start_byte:end].decode("utf-8", errors="replace"))
+    return "".join(parts), trivia_nodes[0].start_byte, trivia_nodes[-1].end_byte
+
+
+def _chunk_rust_impl(impl_node: Node, content_bytes: bytes, language: str, parent_path: str = "") -> list[Chunk]:
+    """Extract method chunks from a Rust `impl` block with `TypeName.method_name` symbols.
+
+    For `impl Trait for Type` (trait impl), methods get the trait name as parent and
+    `Trait.method_name` as the qualified symbol. For inherent `impl Type`, parent and
+    qualified prefix are both `Type`. Generics like `Container<T>` collapse to the
+    base identifier (`Container`). `parent_path` (from an enclosing mod) is prepended
+    to all emitted symbols.
+    """
+    trait_node = impl_node.child_by_field_name("trait")
+    type_node = impl_node.child_by_field_name("type")
+    if type_node is None:
+        return []
+
+    if trait_node is not None:
+        # `impl Trait for Type` — methods are qualified by trait
+        trait_name = _rust_base_identifier(trait_node, content_bytes)
+        target_name = _rust_base_identifier(type_node, content_bytes)
+        qualified_prefix = trait_name
+        parent_for_methods = trait_name
+    else:
+        # Inherent `impl Type` (possibly with generics) — qualified by type
+        target_name = _rust_base_identifier(type_node, content_bytes)
+        qualified_prefix = target_name
+        parent_for_methods = target_name
+
+    # Capture full impl signature (impl line through `where` clause, before `{`)
+    # so the rendered parent_signature reflects generics and constraints, not just
+    # the base name.
+    body = impl_node.child_by_field_name("body")
+    if body is not None:
+        impl_prefix = content_bytes[impl_node.start_byte:body.start_byte].decode("utf-8", errors="replace").rstrip()
+    else:
+        impl_prefix = f"impl {target_name}"
+    if len(impl_prefix) > 200:
+        impl_prefix = impl_prefix[:200] + "..."
+    parent_signature = impl_prefix
+
+    # Negative impl (e.g. `impl !Send for Foo {}`) or empty body — emit a
+    # single chunk for the impl itself so it's searchable by trait name.
+    if body is None:
+        text = content_bytes[impl_node.start_byte:impl_node.end_byte].decode("utf-8", errors="replace")
+        symbol = f"{parent_path}.{qualified_prefix}" if parent_path else qualified_prefix
+        return [Chunk(
+            text=text,
+            chunk_type="class",
+            symbol_name=symbol,
+            signature=impl_prefix,
+            parent_symbol=parent_for_methods,
+            parent_signature=parent_signature,
+            start_line=impl_node.start_point[0] + 1,
+            end_line=impl_node.end_point[0] + 1,
+            language=language,
+        )]
+
+    # Map an associated item's node type to its chunk_type. Mirrors the
+    # top-level type_map for these node types.
+    _ASSOC_CHUNK_TYPE = {
+        "function_item": "method",
+        "const_item": "property",
+        "static_item": "property",
+        "type_item": "class",
+    }
+
+    chunks: list[Chunk] = []
+    for child in body.children:
+        if child.type not in _ASSOC_CHUNK_TYPE:
+            continue
+        name_node = child.child_by_field_name("name")
+        if name_node is None:
+            continue
+        item_name = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
+        text = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        if not text.strip():
+            continue
+
+        # Attach preceding `///` doc comments and `#[..]` attributes so they
+        # are searchable from the item's chunk (not stranded in preamble).
+        trivia_text, trivia_start, _ = _collect_rust_preceding_trivia(child, content_bytes)
+        start_line = child.start_point[0] + 1
+        if trivia_text:
+            text = trivia_text + text
+            start_line = content_bytes[:trivia_start].count(b"\n") + 1
+
+        signature = text.split("\n")[0].rstrip()
+        if len(signature) > 200:
+            signature = signature[:200] + "..."
+        chunks.append(Chunk(
+            text=text,
+            chunk_type=_ASSOC_CHUNK_TYPE[child.type],
+            symbol_name=f"{parent_path}.{qualified_prefix}.{item_name}" if parent_path else f"{qualified_prefix}.{item_name}",
+            signature=signature,
+            parent_symbol=parent_for_methods,
+            parent_signature=parent_signature,
+            start_line=start_line,
+            end_line=child.end_point[0] + 1,
+            language=language,
+        ))
+
+    # Negative impl or otherwise empty body (e.g. `impl !Send for Foo {}`):
+    # emit a single chunk for the impl itself so it's searchable by trait
+    # name. Without this, an empty `{}` body would produce no chunks.
+    if not chunks:
+        text = content_bytes[impl_node.start_byte:impl_node.end_byte].decode("utf-8", errors="replace")
+        symbol = f"{parent_path}.{qualified_prefix}" if parent_path else qualified_prefix
+        chunks.append(Chunk(
+            text=text,
+            chunk_type="class",
+            symbol_name=symbol,
+            signature=impl_prefix,
+            parent_symbol=parent_for_methods,
+            parent_signature=parent_signature,
+            start_line=impl_node.start_point[0] + 1,
+            end_line=impl_node.end_point[0] + 1,
+            language=language,
+        ))
+
+    return chunks
+
+
+def _chunk_rust_trait(trait_node: Node, content_bytes: bytes, language: str, parent_path: str = "") -> list[Chunk]:
+    """Extract method chunks from a Rust `trait` body.
+
+    Both required method signatures (no body) and default method bodies become
+    `method` chunks qualified by the trait name (e.g. `WithDefaults.default_impl`).
+    """
+    name_node = trait_node.child_by_field_name("name")
+    if name_node is None:
+        return []
+    trait_name = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
+
+    body = trait_node.child_by_field_name("body")
+    if body is None:
+        return []
+
+    # Capture trait signature for parent_signature
+    if body is not None:
+        trait_prefix = content_bytes[trait_node.start_byte:body.start_byte].decode("utf-8", errors="replace").rstrip()
+    else:
+        trait_prefix = f"trait {trait_name}"
+    if len(trait_prefix) > 200:
+        trait_prefix = trait_prefix[:200] + "..."
+
+    chunks: list[Chunk] = []
+    for child in body.children:
+        # Required (no body) declarations are `function_signature_item`;
+        # default methods with bodies are `function_item`.
+        if child.type not in ("function_item", "function_signature_item"):
+            continue
+        item_name_node = child.child_by_field_name("name")
+        if item_name_node is None:
+            continue
+        method_name = content_bytes[item_name_node.start_byte:item_name_node.end_byte].decode("utf-8", errors="replace")
+        text = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        if not text.strip():
+            continue
+
+        # Attach preceding `///` doc comments and `#[..]` attributes.
+        trivia_text, trivia_start, _ = _collect_rust_preceding_trivia(child, content_bytes)
+        start_line = child.start_point[0] + 1
+        if trivia_text:
+            text = trivia_text + text
+            start_line = content_bytes[:trivia_start].count(b"\n") + 1
+
+        signature = text.split("\n")[0].rstrip()
+        if len(signature) > 200:
+            signature = signature[:200] + "..."
+        # Distinguish trait default method bodies (`function_item` with body)
+        # from required method signatures (`function_signature_item`, no body)
+        # so they don't collide with impl overrides that share the symbol.
+        chunk_type = "method_default" if child.type == "function_item" else "method"
+        chunks.append(Chunk(
+            text=text,
+            chunk_type=chunk_type,
+            symbol_name=f"{parent_path}.{trait_name}.{method_name}" if parent_path else f"{trait_name}.{method_name}",
+            signature=signature,
+            parent_symbol=trait_name,
+            parent_signature=trait_prefix,
+            start_line=start_line,
+            end_line=child.end_point[0] + 1,
+            language=language,
+        ))
+
+    return chunks
 
 
 def _extract_signature(text: str) -> str:
@@ -605,8 +1037,19 @@ def _extract_preamble(content_bytes: bytes, extracted_ranges: list[tuple[int, in
             language=language,
         )
 
-    # Sort ranges by start position
+    # Merge overlapping/adjacent ranges first. Without this, a parent range
+    # (e.g. a Rust `mod_item`) overlapping its children's ranges causes the
+    # gap-detection algorithm below to treat the child's bytes as "outside"
+    # the parent and leak the parent's trailing text (e.g. closing braces)
+    # into the preamble.
     ranges = sorted(extracted_ranges)
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    ranges = merged
     preamble_parts: list[str] = []
     first_line = None  # track actual source line numbers
     last_line = None
@@ -764,7 +1207,7 @@ def _chunk_config(content: str, language: str, parser) -> list[Chunk]:
 
 
 def _is_top_level_yaml(node: Node) -> bool:
-    """Check if a YAML block_mapping_pair is at the top level (not nested)."""
+    """Check if a block_mapping_pair is at the top level (not nested)."""
     # Walk up: block_mapping_pair -> block_mapping -> block_node -> ... -> stream
     parent = node.parent
     depth = 0

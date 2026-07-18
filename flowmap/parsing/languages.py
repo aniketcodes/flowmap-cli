@@ -21,6 +21,7 @@ _REGISTRY: dict[str, tuple[str, str, str]] = {
     ".go":   ("tree_sitter_go",          "language",            "code"),
     ".java": ("tree_sitter_java",        "language",            "code"),
     ".swift": ("tree_sitter_swift",      "language",            "code"),
+    ".rs":   ("tree_sitter_rust",        "language",            "code"),
     # Config files
     ".json": ("tree_sitter_json",        "language",            "config"),
     ".yaml": ("tree_sitter_yaml",        "language",            "config"),
@@ -45,7 +46,7 @@ SUPPORTED_FILENAMES = {"Dockerfile", "Makefile", "Jenkinsfile", "Vagrantfile"}
 
 # Code extensions that lack a tree-sitter grammar — users should know these get fallback chunking
 _CODE_EXTENSIONS_WITHOUT_GRAMMAR = {
-    ".rs", ".c", ".cpp", ".h", ".hpp", ".kt", ".rb", ".php", ".cs",
+    ".c", ".cpp", ".h", ".hpp", ".kt", ".rb", ".php", ".cs",
 }
 
 _WARNED_EXTENSIONS: set[str] = set()
@@ -105,6 +106,7 @@ def get_language_name(extension: str) -> str:
         ".go": "go",
         ".java": "java",
         ".swift": "swift",
+        ".rs": "rust",
         ".json": "json",
         ".yaml": "yaml",
         ".yml": "yaml",
