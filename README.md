@@ -1,14 +1,37 @@
+<div align="center">
+
 # FlowMap
 
 **Cross-repo code intelligence CLI for LLMs.**
 
-FlowMap indexes your codebases with tree-sitter AST parsing, stores them in a local vector database, and gives you fast hybrid search (semantic + BM25 full-text + keyword + symbol) across all your repos. Built for developers who use LLMs for code navigation and want better context than `grep`.
+One query. Cross-repo. Polyglot. Ranked by relevance.
 
-### Why?
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-424%20passing-brightgreen.svg)](tests/)
+[![Code style](https://img.shields.io/badge/code%20style-ruff-black.svg)](https://github.com/astral-sh/ruff)
+
+[Quick Start](#quick-start) • [Features](#features) • [Examples](#real-world-workflows) • [Commands](#commands) • [Docs](#how-it-works)
+
+</div>
+
+<div align="center">
+
+### See it in action
+
+[![FlowMap demo — cross-repo semantic code search](https://img.youtube.com/vi/vIUG4y9YAVs/hqdefault.jpg)](https://www.youtube.com/watch?v=vIUG4y9YAVs)
+
+One query. Cross-repo. Polyglot. Ranked by relevance.
+
+</div>
+
+---
+
+## Why?
 
 You have 5 repos. You know the retry logic exists *somewhere*. With `grep` you'd need to search each repo, wade through hundreds of string matches, and hope you find the right function. With FlowMap:
 
-```
+```console
 $ flowmap search "retry logic with exponential backoff"
 [1] api-gateway/src/utils/retry.ts:12-45  (rrf: 0.0312, via: ripgrep+semantic)
     export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOptions): Promise<T> { ...
@@ -20,124 +43,68 @@ $ flowmap search "retry logic with exponential backoff"
     func Retry(ctx context.Context, fn func() error, opts ...Option) error { ...
 ```
 
-One query. Three repos. Three languages. Ranked by relevance. That's the point.
+**That's the point.** Hybrid search fuses ripgrep, BM25/FTS, vector similarity, and symbol lookup into one ranked result — semantic understanding, not just string matching.
 
 ---
 
-## What it does
+## Features
 
-- **Indexes your repos** with tree-sitter, extracting functions, classes, methods, and their signatures
-- **Hybrid search** fuses 4 channels: ripgrep (live keyword), BM25/FTS (ranked full-text), vector similarity (semantic), and symbol lookup (exact match) using Reciprocal Rank Fusion
-- **Incremental reindexing** via `git diff` -- only re-embeds changed files
-- **Structural history** shows AST-level diffs (function added/removed/signature changed) over time
-- **Works across repos** -- search one query, get results from all your projects
-
-## Languages with AST support
-
-Full AST parsing (functions, classes, methods, signatures):
-
-**Python** | **TypeScript** | **JavaScript** | **TSX/JSX** | **Go** | **Java** | **Swift**
-
-Structural parsing of top-level keys:
-
-**YAML** | **JSON**
-
-These get line-based fallback chunking (indexed, but no symbol extraction):
-
-Rust | C | C++ | Kotlin | Ruby | PHP | C# | SQL | GraphQL | Protobuf | Terraform | Shell | Markdown
+| Feature | What it does |
+| --- | --- |
+| **AST-aware indexing** | Tree-sitter extracts functions, classes, methods, and signatures — not raw text |
+| **Hybrid search** | 4 channels fused via Reciprocal Rank Fusion: ripgrep, BM25/FTS, vector similarity, symbol lookup |
+| **Incremental reindexing** | `git diff` → only re-embeds changed files (seconds, not minutes) |
+| **Structural history** | AST-level diffs over time: "function `processPayment` had its signature changed on March 3rd" |
+| **Cross-repo by default** | One query, all your projects — no `--repo` flag needed |
+| **Local-first** | Embeddings via Ollama, storage via LanceDB + SQLite — no cloud, no API keys, no telemetry |
+| **JSON output everywhere** | `--format json` on every command for piping into LLMs |
+| **Crash recovery** | Interrupted indexing resumes cleanly; no half-indexed state |
 
 ---
 
 ## Quick start
 
-### 1. Install
-
 ```bash
+# 1. Install FlowMap (uv is the fastest path)
 git clone https://github.com/aniketcodes/flowmap-cli.git
 cd flowmap-cli
 uv tool install .
-```
 
-This installs a global `flowmap` command in its own isolated environment — no PATH editing or shell-rc changes.
-
-> Don't have uv? Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh`
->
-> Requires Python 3.11+ — uv provisions it automatically.
->
-> If `flowmap` isn't found afterward, run `uv tool update-shell` once and reopen your terminal.
->
-> Prefer not to install globally? Run `uv sync` and prefix commands with `uv run` (e.g. `uv run flowmap --help`) from the repo.
-
-### 2. Verify
-
-```bash
-flowmap --help
-```
-
-### 3. Install Ollama (for embeddings)
-
-FlowMap uses [Ollama](https://ollama.com) for embeddings by default. It's free, runs locally, and needs no API keys.
-
-```bash
-# Install Ollama
+# 2. Install Ollama (free, local embeddings)
 brew install ollama                              # macOS
 # Linux:   curl -fsSL https://ollama.com/install.sh | sh
-# Windows: download the installer from https://ollama.com/download
-
-# Start the server
+# Windows: download from https://ollama.com/download
 ollama serve
-
-# Pull the embedding model (~640MB download, one-time)
 ollama pull qwen3-embedding:0.6b
-```
 
-### 4. Install ripgrep (for keyword search)
+# 3. Install ripgrep (for keyword search)
+brew install ripgrep                             # macOS
+# Ubuntu/Debian: apt install ripgrep
 
-```bash
-# macOS
-brew install ripgrep
-
-# Ubuntu/Debian
-apt install ripgrep
-
-# Or see https://github.com/BurntSushi/ripgrep#installation
-```
-
-### 5. Add your repos
-
-```bash
-# Initialize config
+# 4. Add your repos and index
 flowmap init
-
-# Add repos (use absolute paths)
 flowmap repos add /path/to/your/project
-flowmap repos add /path/to/another/project
-
-# Verify
-flowmap repos list
-```
-
-### 6. Index
-
-```bash
 flowmap index
-```
 
-This walks each repo, parses files with tree-sitter, generates embeddings via Ollama, and stores everything locally. First run takes a few minutes depending on repo size. Subsequent runs are incremental (seconds).
-
-### 7. Search
-
-```bash
+# 5. Search
 flowmap search "retry logic"
 ```
 
-That's it. You're searching across all your repos.
+That's it. First index takes a few minutes depending on repo size; subsequent runs are incremental (seconds).
+
+<details>
+<summary><strong>Alternative: without global install</strong></summary>
+
+```bash
+uv sync
+uv run flowmap search "retry logic"
+```
+
+</details>
 
 ---
 
 ## Real-world workflows
-
-These are the things FlowMap is actually good at. Copy-paste these.
 
 ### "I just joined a new team. How is this codebase structured?"
 
@@ -147,7 +114,7 @@ flowmap index
 flowmap map
 ```
 
-This gives you every class, function, and file at a glance — across all repos.
+Every class, function, and file at a glance — across all repos.
 
 ### "Where is the code that does X?"
 
@@ -157,7 +124,7 @@ flowmap search "retry logic"
 flowmap search "database connection pool"
 ```
 
-This is the core use case. You describe what you're looking for in plain English, and FlowMap finds the relevant functions/classes across all your repos. It's not just grep — it understands meaning.
+The core use case. Describe what you're looking for in plain English; FlowMap finds the relevant functions/classes across all your repos.
 
 ### "I know the function name but not which repo it's in"
 
@@ -165,15 +132,12 @@ This is the core use case. You describe what you're looking for in plain English
 flowmap search "processOrder" --mode symbol
 ```
 
-Symbol mode does exact/fuzzy matching on function and class names. Instant results, no embeddings needed.
+Exact/fuzzy match on function and class names. Instant, no embeddings needed.
 
 ### "I found a function. Show me the full source."
 
 ```bash
-# From search results, you see: auth-service/src/auth.py:25-70
 flowmap cat src/auth.py --repo auth-service --lines 25-70
-
-# Or jump directly to a symbol
 flowmap cat src/auth.py --repo auth-service --symbol validateToken
 ```
 
@@ -184,18 +148,13 @@ flowmap history "validateToken"
 flowmap history "payment" --repo payment-service --since "3 months ago"
 ```
 
-This shows AST-level diffs — not just "file changed" but "function `processPayment` had its signature changed on March 3rd."
+AST-level diffs — not just "file changed" but "function `processPayment` had its signature changed on March 3rd."
 
 ### "I need to give an LLM context about my codebase"
 
 ```bash
-# Structural overview
 flowmap map --format json
-
-# Find relevant code for a question
 flowmap search "how does auth work" --format json
-
-# Read specific files
 flowmap cat src/auth.py --repo my-service --format json
 ```
 
@@ -207,7 +166,7 @@ All commands support `--format json`. Pipe them to Claude, ChatGPT, or any LLM t
 flowmap index
 ```
 
-That's it. FlowMap detects what changed via `git diff` and only re-embeds the modified files. Takes seconds.
+Detects what changed via `git diff` and only re-embeds the modified files. Takes seconds.
 
 ### "Something is broken. How do I debug?"
 
@@ -215,16 +174,15 @@ That's it. FlowMap detects what changed via `git diff` and only re-embeds the mo
 flowmap doctor
 ```
 
-This checks: Ollama running? Model pulled? Repos exist? Index healthy? Dimension mismatch? It tells you exactly what's wrong and how to fix it.
+Checks: Ollama running? Model pulled? Repos exist? Index healthy? Dimension mismatch? Tells you exactly what's wrong.
 
 ### "I want fast grep-style search without Ollama"
 
 ```bash
 flowmap search "TODO" --mode keyword
-flowmap search "FIXME" --mode keyword
 ```
 
-Keyword mode uses ripgrep directly. No embeddings, no Ollama, instant results.
+Uses ripgrep directly. No embeddings, instant results.
 
 ---
 
@@ -253,9 +211,8 @@ flowmap reset --all              # Delete all index data
 
 ## Commands
 
-### `flowmap search`
-
-The main command. Searches across all indexed repos.
+<details open>
+<summary><strong><code>flowmap search</code></strong> — the main command</summary>
 
 ```bash
 # Default: hybrid search (semantic + BM25 + keyword + symbol fusion)
@@ -282,36 +239,29 @@ flowmap search "complex query" --rerank
 
 **Search modes:**
 
+| Mode | What it does | Speed | Needs Ollama? |
+| --- | --- | --- | --- |
+| `hybrid` (default) | Fuses ripgrep + BM25/FTS + vector + symbol via RRF | ~1-2s | Yes |
+| `semantic` | Vector similarity only | ~0.5s | Yes |
+| `keyword` | ripgrep only (live filesystem grep) | ~0.1s | No |
+| `symbol` | Exact/suffix/contains match on symbol names | ~0.1s | No |
 
-| Mode               | What it does                                   | Speed | Needs Ollama? |
-| ------------------ | ---------------------------------------------- | ----- | ------------- |
-| `hybrid` (default) | Fuses ripgrep + BM25/FTS + vector + symbol via RRF | ~1-2s | Yes           |
-| `semantic`         | Vector similarity only                         | ~0.5s | Yes           |
-| `keyword`          | ripgrep only (live filesystem grep)            | ~0.1s | No            |
-| `symbol`           | Exact/suffix/contains match on symbol names    | ~0.1s | No            |
+</details>
 
-
-### `flowmap index`
-
-Build or update the search index.
+<details>
+<summary><strong><code>flowmap index</code></strong> — build or update the search index</summary>
 
 ```bash
-# Index all repos (incremental -- only re-embeds changed files)
-flowmap index
-
-# Force full re-index
-flowmap index --full
-
-# Index a specific repo
-flowmap index --repo my-service
-
-# Preview what would be indexed (fast, no parsing)
-flowmap index --dry-run
+flowmap index                    # Index all repos (incremental)
+flowmap index --full             # Force full re-index
+flowmap index --repo my-service  # Index a specific repo
+flowmap index --dry-run          # Preview what would be indexed
 ```
 
-### `flowmap map`
+</details>
 
-Show a structural overview of your indexed repos -- classes, functions, file counts, languages.
+<details>
+<summary><strong><code>flowmap map</code></strong> — structural overview of repos</summary>
 
 ```bash
 flowmap map
@@ -319,64 +269,47 @@ flowmap map --repo my-service
 flowmap map --format json
 ```
 
-### `flowmap symbols`
+</details>
 
-List and search symbols (functions, classes, methods) across repos.
+<details>
+<summary><strong><code>flowmap symbols</code></strong> — list/search symbols</summary>
 
 ```bash
-# List all symbols
-flowmap symbols
-
-# Search for symbols matching a name
-flowmap symbols "process"
-
-# Filter by type
-flowmap symbols --type class
+flowmap symbols                              # All symbols
+flowmap symbols "process"                    # Search by name
+flowmap symbols --type class                 # Filter by type
 flowmap symbols --type function --repo my-service
-
-# JSON output
 flowmap symbols "validate" --format json
 ```
 
-### `flowmap cat`
+</details>
 
-Read source files from configured repos. Supports line ranges and symbol-based lookup.
+<details>
+<summary><strong><code>flowmap cat</code></strong> — read source files</summary>
 
 ```bash
-# Read a file (auto-detects repo from path)
-flowmap cat my-service/src/auth.py
-
-# Specific line range
+flowmap cat my-service/src/auth.py                              # Auto-detect repo
 flowmap cat src/auth.py --repo my-service --lines 25-70
-
-# Jump to a symbol
 flowmap cat src/auth.py --repo my-service --symbol validateToken
-
-# JSON output (useful for LLM context)
 flowmap cat src/service.ts --repo my-service --format json
 ```
 
-### `flowmap history`
+</details>
 
-Show a timeline of structural changes -- which functions were added, removed, or had their signatures changed.
+<details>
+<summary><strong><code>flowmap history</code></strong> — structural change timeline</summary>
 
 ```bash
-# What changed around "auth"?
 flowmap history "validateToken"
-
-# Scoped to a repo and time window
 flowmap history "payment" --repo payment-service --since "3 months ago"
-
-# Focus on a specific symbol
 flowmap history "OrderProcessor" --symbol OrderProcessor.process
-
-# JSON output
 flowmap history "auth" --format json
 ```
 
-### `flowmap status`
+</details>
 
-Show index status for all repos.
+<details>
+<summary><strong><code>flowmap status</code></strong> — index health</summary>
 
 ```bash
 flowmap status
@@ -384,15 +317,15 @@ flowmap status
 
 ```
 Index: 12,450 total chunks
-
   my-service                      4,230 chunks  2026-04-01  (main, abc1234)
   auth-service                    3,100 chunks  2026-04-01  (main, def5678)
   shared-lib                      5,120 chunks  2026-03-28  (main, 789abcd)
 ```
 
-### `flowmap doctor`
+</details>
 
-Check that everything is set up correctly.
+<details>
+<summary><strong><code>flowmap doctor</code></strong> — system health check</summary>
 
 ```bash
 flowmap doctor
@@ -400,34 +333,49 @@ flowmap doctor
 
 Checks: repo paths exist, Ollama is running, embedding model is pulled, ripgrep is installed, index is healthy, no dimension mismatches.
 
-### `flowmap repos`
+</details>
 
-Manage configured repositories.
+<details>
+<summary><strong><code>flowmap repos</code></strong> — manage configured repositories</summary>
 
 ```bash
 flowmap repos add /path/to/repo          # Add a repo
-flowmap repos add /path/to/repo --name custom-name  # Add with a custom alias
-flowmap repos list                        # List all repos and their index status
-flowmap repos paths                       # Output repo paths (one per line)
+flowmap repos add /path/to/repo --name custom-name
+flowmap repos list
+flowmap repos paths                      # One path per line
 ```
 
-### `flowmap reset`
+</details>
 
-Delete index data.
+<details>
+<summary><strong><code>flowmap reset</code></strong> — delete index data</summary>
 
 ```bash
 flowmap reset --repo my-service    # Reset one repo
 flowmap reset --all                # Reset everything
 ```
 
-### `flowmap init`
+</details>
 
-Create a starter config file.
+<details>
+<summary><strong><code>flowmap init</code></strong> — create a starter config file</summary>
 
 ```bash
 flowmap init                # Creates ~/.flowmap/config.yaml
 flowmap init --force        # Overwrite existing config (preserves repo list)
 ```
+
+</details>
+
+---
+
+## Languages with AST support
+
+| Tier | Languages |
+| --- | --- |
+| **Full AST** (functions, classes, methods, signatures) | **Python** • **TypeScript** • **JavaScript** • **TSX/JSX** • **Go** • **Java** • **Swift** • **Rust** |
+| **Structural** (top-level keys) | **YAML** • **JSON** |
+| **Fallback** (line-based, no symbol extraction) | C • C++ • Kotlin • Ruby • PHP • C# • SQL • GraphQL • Protobuf • Terraform • Shell • Markdown |
 
 ---
 
@@ -478,7 +426,8 @@ vendor/
 
 ## Embedding backends
 
-### Ollama (default, recommended)
+<details>
+<summary><strong>Ollama</strong> (default, recommended)</summary>
 
 Free, local, no API keys. Runs on CPU or GPU.
 
@@ -487,8 +436,6 @@ ollama serve
 ollama pull qwen3-embedding:0.6b
 ```
 
-Config:
-
 ```yaml
 embedding:
   backend: ollama
@@ -496,24 +443,26 @@ embedding:
   ollama_url: http://localhost:11434
 ```
 
-### Sentence-transformers (optional)
+</details>
+
+<details>
+<summary><strong>Sentence-transformers</strong> (optional)</summary>
 
 Local Python-based embeddings. No external server needed, but requires PyTorch.
 
 ```bash
-# If you installed with `uv tool install .`:
 uv tool install ".[local-embeddings]"
 # Or, in a cloned repo:
 uv sync --extra local-embeddings
 ```
-
-Config:
 
 ```yaml
 embedding:
   backend: sentence-transformers
   model: nomic-ai/CodeRankEmbed
 ```
+
+</details>
 
 ---
 
@@ -553,7 +502,7 @@ Your repos                FlowMap                    Search
 2. Parse each file with tree-sitter to extract functions, classes, methods
 3. Generate embeddings via Ollama (batched, with retry)
 4. Store in LanceDB (vectors) + SQLite (metadata, state tracking)
-5. Incremental updates via `git diff` -- only changed files are re-embedded
+5. Incremental updates via `git diff` — only changed files are re-embedded
 
 **Search pipeline:**
 
@@ -584,18 +533,25 @@ flowmap cat src/auth.py --repo my-service --format json
 
 ## Troubleshooting
 
-### `flowmap doctor` reports issues
+<details>
+<summary><strong><code>flowmap doctor</code> reports issues</strong></summary>
 
 Run `flowmap doctor` first. It checks everything and tells you what's wrong.
 
-### "Ollama not running"
+</details>
+
+<details>
+<summary><strong>"Ollama not running"</strong></summary>
 
 ```bash
 ollama serve          # Start Ollama
 ollama pull qwen3-embedding:0.6b   # Pull the model
 ```
 
-### "ripgrep (rg) not installed"
+</details>
+
+<details>
+<summary><strong>"ripgrep (rg) not installed"</strong></summary>
 
 Keyword search and hybrid mode need ripgrep. Install it:
 
@@ -606,7 +562,10 @@ apt install ripgrep    # Ubuntu/Debian
 
 Without ripgrep, `--mode semantic` and `--mode symbol` still work.
 
-### "Dimension mismatch"
+</details>
+
+<details>
+<summary><strong>"Dimension mismatch"</strong></summary>
 
 You changed the embedding model after indexing. Fix:
 
@@ -614,7 +573,10 @@ You changed the embedding model after indexing. Fix:
 flowmap index --full
 ```
 
-### Search returns no results
+</details>
+
+<details>
+<summary><strong>Search returns no results</strong></summary>
 
 ```bash
 flowmap status        # Check if repos are indexed
@@ -622,7 +584,10 @@ flowmap index         # Re-index if needed
 flowmap doctor        # Check system health
 ```
 
-### Slow indexing
+</details>
+
+<details>
+<summary><strong>Slow indexing</strong></summary>
 
 First index is slow (parses all files + generates embeddings). Subsequent runs are incremental and fast. For very large repos, ensure Ollama has enough resources:
 
@@ -631,14 +596,18 @@ First index is slow (parses all files + generates embeddings). Subsequent runs a
 curl http://localhost:11434/api/tags
 ```
 
+</details>
+
 ---
 
 ## Requirements
 
-- **Python** >= 3.11
-- **Ollama** (for embeddings) -- [install](https://ollama.com)
-- **ripgrep** (for keyword search) -- [install](https://github.com/BurntSushi/ripgrep#installation)
-- **git** (for file listing and incremental reindex)
+| Tool | Purpose |
+| --- | --- |
+| **Python** `>= 3.11` | Runtime |
+| **Ollama** | Embedding generation — [install](https://ollama.com) |
+| **ripgrep** | Keyword search — [install](https://github.com/BurntSushi/ripgrep#installation) |
+| **git** | File listing and incremental reindex |
 
 ---
 
@@ -661,14 +630,14 @@ uv run ruff check flowmap/
 
 ### Test suite
 
-424 tests covering:
+**424 tests** covering:
 
 - Tree-sitter chunking (Python, TypeScript, Go, Java, YAML, JSON)
 - LanceDB store operations (real database, not mocked)
 - CLI commands (all 11 commands)
 - Hybrid search fusion and deduplication
 - Incremental reindexing with git
-- End-to-end: index -> search -> cat pipeline
+- End-to-end: index → search → cat pipeline
 - SQL escaping and special character handling
 - Crash recovery (embedding failure preserves data)
 - History/timeline with structural diffs
@@ -677,31 +646,50 @@ uv run ruff check flowmap/
 
 ## FAQ
 
-### How is this different from `grep` / `ripgrep`?
+<details>
+<summary><strong>How is this different from <code>grep</code> / <code>ripgrep</code>?</strong></summary>
 
-ripgrep finds literal text matches. FlowMap understands code structure -- it knows what a function is, what class it belongs to, and can find semantically similar code even when the exact words don't match. FlowMap actually *uses* ripgrep as one of its three search channels and fuses the results.
+ripgrep finds literal text matches. FlowMap understands code structure — it knows what a function is, what class it belongs to, and can find semantically similar code even when the exact words don't match. FlowMap actually *uses* ripgrep as one of its three search channels and fuses the results.
 
-### How is this different from GitHub code search?
+</details>
+
+<details>
+<summary><strong>How is this different from GitHub code search?</strong></summary>
 
 GitHub code search works on github.com. FlowMap works on your local repos, offline, with no data leaving your machine. It also searches *across* multiple repos at once and provides structural history (AST-level diffs over time).
 
-### Does my code leave my machine?
+</details>
+
+<details>
+<summary><strong>Does my code leave my machine?</strong></summary>
 
 No. Everything runs locally. Embeddings are generated by Ollama on your machine. Data is stored in `~/.flowmap/data`. No cloud services, no API keys, no telemetry.
 
-### How much disk space does it use?
+</details>
+
+<details>
+<summary><strong>How much disk space does it use?</strong></summary>
 
 Roughly 1-2 MB per 1,000 source files. A 10-repo setup with 50K files typically uses ~100 MB for the LanceDB vector store.
 
-### Can I use OpenAI / Anthropic / other API embeddings?
+</details>
 
-Not currently. FlowMap supports Ollama (recommended) and sentence-transformers. Adding API-based backends is straightforward if there's demand -- open an issue.
+<details>
+<summary><strong>Can I use OpenAI / Anthropic / other API embeddings?</strong></summary>
 
-### How long does indexing take?
+Not currently. FlowMap supports Ollama (recommended) and sentence-transformers. Adding API-based backends is straightforward if there's demand — open an issue.
 
-First full index: ~1-5 minutes for a typical repo (depends on size and Ollama speed). Incremental updates after `git pull`: seconds -- only changed files are re-embedded.
+</details>
 
-### Can I use this with Claude Code / Cursor / Copilot?
+<details>
+<summary><strong>How long does indexing take?</strong></summary>
+
+First full index: ~1-5 minutes for a typical repo (depends on size and Ollama speed). Incremental updates after `git pull`: seconds — only changed files are re-embedded.
+
+</details>
+
+<details>
+<summary><strong>Can I use this with Claude Code / Cursor / Copilot?</strong></summary>
 
 Yes. Use `--format json` to pipe structured results into any LLM tool:
 
@@ -711,15 +699,23 @@ flowmap cat src/auth.py --repo my-service --format json
 flowmap map --format json
 ```
 
-### What if Ollama is too slow?
+</details>
+
+<details>
+<summary><strong>What if Ollama is too slow?</strong></summary>
 
 - Use a GPU-accelerated Ollama install for faster embeddings
 - Use `--mode keyword` or `--mode symbol` for searches that don't need embeddings
-- The default model (`qwen3-embedding:0.6b`) is small and fast -- larger models are more accurate but slower
+- The default model (`qwen3-embedding:0.6b`) is small and fast — larger models are more accurate but slower
 
-### Can I add support for a new language?
+</details>
+
+<details>
+<summary><strong>Can I add support for a new language?</strong></summary>
 
 If tree-sitter has a grammar for your language, yes. Add the grammar package to `pyproject.toml`, register the extension mapping in `flowmap/parsing/languages.py`, and define symbol extraction rules in `flowmap/parsing/chunker.py`. PRs welcome.
+
+</details>
 
 ---
 
@@ -741,27 +737,27 @@ uv sync --extra dev
 uv run pytest tests/ -v
 ```
 
-All 424 tests should pass. If they don't, your environment has an issue -- fix that first.
+All 424 tests should pass. If they don't, your environment has an issue — fix that first.
 
 ### Making changes
 
 1. **Create a branch** from `master`
-2. **Write your code** -- follow the existing style (4-space indent, no docstrings on obvious functions, no unnecessary abstractions)
-3. **Add tests** for any new behavior -- look at existing tests for patterns
-4. **Run the full test suite** -- `uv run pytest tests/ -v`
-5. **Lint** -- `uv run ruff check flowmap/`
+2. **Write your code** — follow the existing style (4-space indent, no docstrings on obvious functions, no unnecessary abstractions)
+3. **Add tests** for any new behavior — look at existing tests for patterns
+4. **Run the full test suite** — `uv run pytest tests/ -v`
+5. **Lint** — `uv run ruff check flowmap/`
 6. **Open a PR** with a clear description of what and why
 
 ### What makes a good PR
 
 - **Bug fixes** with a test that would have caught the bug
-- **New tree-sitter language grammars** (Python, TS, Go, Java are done -- Rust, C, Ruby are not)
+- **New tree-sitter language grammars** (Python, TS, Go, Java, Swift, Rust are done — C, C++, Ruby are not)
 - **Performance improvements** with before/after measurements
 - **Better error messages** for common failure modes
 
 ### What to avoid
 
-- Don't add features nobody asked for -- open an issue first to discuss
+- Don't add features nobody asked for — open an issue first to discuss
 - Don't refactor working code for style preferences
 - Don't add dependencies without a strong reason
 - Don't break the `--format json` contract (other tools depend on it)
@@ -810,7 +806,7 @@ tests/
 
 - **Large repos (>50K files):** Memory usage scales with repo size. The entire chunk + embedding set is held in memory during indexing. For very large monorepos, ensure adequate RAM.
 - **Windows:** Best-effort support. The advisory file lock behavior differs from Unix. Primary development and testing is on macOS/Linux.
-- **AST coverage:** Only Python, TypeScript, JavaScript, Go, Java, Swift, YAML, and JSON have full tree-sitter grammars. Other languages fall back to line-based chunking (still indexed, but no symbol extraction).
+- **AST coverage:** Only Python, TypeScript, JavaScript, Go, Java, Swift, Rust, YAML, and JSON have full tree-sitter grammars. Other languages fall back to line-based chunking (still indexed, but no symbol extraction).
 - **Concurrent access:** Designed for single-user CLI use. Don't run `flowmap index` from multiple terminals simultaneously. Search during indexing may return partial results.
 
 ---
@@ -858,25 +854,23 @@ flowmap history "validateToken" --format json
 
 ### When to use FlowMap vs reading files directly
 
-
-| Scenario                             | Use FlowMap                                   | Use file reads                |
-| ------------------------------------ | --------------------------------------------- | ----------------------------- |
-| "Where is the retry logic?"          | `flowmap search "retry logic"`                | -                             |
-| "What does `processOrder` do?"       | `flowmap search "processOrder" --mode symbol` | Then `flowmap cat` the result |
-| "Show me all classes in the project" | `flowmap symbols --type class`                | -                             |
-| "Read lines 50-100 of auth.py"       | -                                             | Read the file directly        |
-| "What changed in auth recently?"     | `flowmap history "auth"`                      | -                             |
-
+| Scenario | Use FlowMap | Use file reads |
+| --- | --- | --- |
+| "Where is the retry logic?" | `flowmap search "retry logic"` | - |
+| "What does `processOrder` do?" | `flowmap search "processOrder" --mode symbol` | Then `flowmap cat` the result |
+| "Show me all classes in the project" | `flowmap symbols --type class` | - |
+| "Read lines 50-100 of auth.py" | - | Read the file directly |
+| "What changed in auth recently?" | `flowmap history "auth"` | - |
 
 ### Tips
 
-- Always use `--format json` when calling FlowMap -- it gives structured output you can parse
-- `flowmap search` returns results ranked by relevance -- the first result is usually the best
+- Always use `--format json` when calling FlowMap — it gives structured output you can parse
+- `flowmap search` returns results ranked by relevance — the first result is usually the best
 - If `flowmap status` shows "not indexed", the user needs to run `flowmap index` first
-- FlowMap searches across ALL configured repos at once -- you don't need to know which repo a function is in
+- FlowMap searches across ALL configured repos at once — you don't need to know which repo a function is in
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE)
