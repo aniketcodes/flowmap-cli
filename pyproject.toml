@@ -45,3 +45,8 @@ flowmap = "flowmap.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flowmap*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "golden: opt-in golden retrieval eval against a live embedding model (FLOWMAP_GOLDEN=1)",
+]

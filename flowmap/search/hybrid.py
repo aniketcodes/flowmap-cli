@@ -1,4 +1,4 @@
-"""4-way hybrid search (ripgrep + BM25/FTS + vector + symbol) with RRF fusion + cross-encoder reranking."""
+"""4-way hybrid search (ripgrep + BM25/FTS + vector + symbol) with RRF fusion + optional Qwen3 reranking."""
 
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ _os.environ.setdefault("TQDM_DISABLE", "1")
 
 RRF_K = 60  # Standard RRF constant (tunable — evaluate against golden set)
 
-# Module-level CrossEncoder cache — avoids 5-10s model reload per reranked search
-_cross_encoder_cache: dict[str, object] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -92,62 +90,26 @@ _WEIGHTS: dict[str, dict[str, float]] = {
 
 
 # ---------------------------------------------------------------------------
-# Cross-encoder reranking
+# Reranking (Qwen3-Reranker; see flowmap/search/qwen_ollama_reranker.py)
 # ---------------------------------------------------------------------------
 
-def _rerank(query: str, candidates: list[HybridResult], model_name: str) -> list[HybridResult]:
-    """Rerank candidates with a cross-encoder. Returns candidates sorted by rerank_score."""
-    try:
-        from sentence_transformers import CrossEncoder
-    except ImportError:
-        log.info(
-            "Cross-encoder reranking unavailable (sentence-transformers not installed). "
-            "Install with: pip install flowmap[local-embeddings]"
-        )
-        return candidates
+def was_reranked(results: list[HybridResult]) -> bool:
+    """True when a reranker actually scored these results. Every backend leaves
+    rerank_score at 0.0 on failure/timeout/no-answer and sorts descending on
+    success, so a real rerank always shows a positive score at the top."""
+    return any(r.rerank_score > 0 for r in results)
 
-    import logging as _logging
 
-    # Save state for cleanup
-    _logger_names = ("transformers", "sentence_transformers", "huggingface_hub")
-    _saved_levels = {name: _logging.getLogger(name).level for name in _logger_names}
-    _saved_hf_offline = _os.environ.get("HF_HUB_OFFLINE")
-
-    try:
-        # Suppress noisy warnings from transformers/sentence-transformers
-        for name in _logger_names:
-            _logging.getLogger(name).setLevel(_logging.ERROR)
-
-        # Load model (cached after first load to avoid 5-10s reload)
-        if model_name in _cross_encoder_cache:
-            reranker = _cross_encoder_cache[model_name]
-        else:
-            reranker = CrossEncoder(model_name)
-            _cross_encoder_cache[model_name] = reranker
-
-        # Block further network access during predict()
-        _os.environ["HF_HUB_OFFLINE"] = "1"
-
-        pairs = [(query, c.text) for c in candidates]
-        scores = reranker.predict(pairs)
-
-        for candidate, score in zip(candidates, scores):
-            candidate.rerank_score = float(score)
-            candidate.score = float(score)
-
-        candidates.sort(key=lambda r: r.rerank_score, reverse=True)
-        return candidates
-    except Exception as e:
-        log.warning("Cross-encoder reranking failed: %s", e)
-        return candidates
-    finally:
-        # Restore logger levels and env vars
-        for name, level in _saved_levels.items():
-            _logging.getLogger(name).setLevel(level)
-        if _saved_hf_offline is None:
-            _os.environ.pop("HF_HUB_OFFLINE", None)
-        else:
-            _os.environ["HF_HUB_OFFLINE"] = _saved_hf_offline
+def _rerank_with_backend(backend: str, query: str, candidates: list[HybridResult], model_name: str,
+                         ollama_url: str = "http://localhost:11434") -> list[HybridResult]:
+    """Dispatch to the configured reranker. Unknown backends fall back to qwen_ollama."""
+    if backend == "qwen_direct":
+        from flowmap.search.qwen_reranker import rerank_qwen
+        return rerank_qwen(query, candidates, model_name)
+    if backend != "qwen_ollama":
+        log.warning("Unknown reranking backend %r; using qwen_ollama", backend)
+    from flowmap.search.qwen_ollama_reranker import rerank_qwen_ollama
+    return rerank_qwen_ollama(query, candidates, model_name, ollama_url)
 
 
 # ---------------------------------------------------------------------------
@@ -162,17 +124,19 @@ def hybrid_search(
     limit: int = 10,
     repo_filter: str | None = None,
     reranking_enabled: bool = False,
-    reranking_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    reranking_model: str = "hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0",
+    reranking_backend: str = "qwen_ollama",
+    reranking_ollama_url: str = "http://localhost:11434",
     regex: bool = False,
     profile: str = "default",
 ) -> list[HybridResult]:
-    """Run all four search methods in parallel, fuse with weighted RRF, rerank with cross-encoder.
+    """Run all four search methods in parallel, fuse with weighted RRF, optionally rerank.
 
     Pipeline:
     1. Parallel: ripgrep (live keyword) + BM25/FTS (ranked lexical) + semantic (vector) + symbol (exact match)
     2. Normalize: map ripgrep lines to containing chunks (dedup BEFORE scoring)
     3. Score: weighted Reciprocal Rank Fusion
-    4. Rerank: cross-encoder on top-30 candidates (if enabled)
+    4. Rerank: Qwen3-Reranker on top-30 candidates (if enabled)
     5. Return top-N results
     """
     query_type = classify_query(query)
@@ -355,10 +319,10 @@ def hybrid_search(
 
     scored.sort(key=lambda r: r.score, reverse=True)
 
-    # --- Step 6: Cross-encoder reranking (on top-30 RRF candidates) ---
+    # --- Step 6: Reranking (on top-30 RRF candidates) ---
     if reranking_enabled and scored:
         top_candidates = scored[:30]
-        reranked = _rerank(query, top_candidates, reranking_model)
+        reranked = _rerank_with_backend(reranking_backend, query, top_candidates, reranking_model, reranking_ollama_url)
         # Merge: reranked top-30 + remaining unranked
         remaining = scored[30:]
         scored = reranked + remaining
