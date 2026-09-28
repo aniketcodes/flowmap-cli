@@ -40,3 +40,8 @@ htmlcov/
 
 eval/
 */log
+# Golden eval scratch and private corpora
+evals/*.local.yaml
+evals/*.local.json
+evals/.work/
+evals/reports/

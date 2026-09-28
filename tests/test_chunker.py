@@ -678,13 +678,17 @@ _MIXED_METHODS = "\n".join([
 """ for i in range(5)],
 ])
 
+# Hoisted out of the f-string: a backslash inside an f-string expression is a
+# SyntaxError before Python 3.12, and this file must collect on 3.11.
+_MIXED_PROPS = " " * 4 + "self._prop_" + " = None\\n    self._prop_".join(str(i) for i in range(15)) + " = None"
+
 PYTHON_MIXED_LARGE_CLASS = f'''\
 class MixedService:
     """Service with mixed method types."""
 
     def __init__(self):
         self.data = 0
-{" " * 4 + "self._prop_" + " = None\\n    self._prop_".join(str(i) for i in range(15)) + " = None"}
+{_MIXED_PROPS}
 
 {_MIXED_METHODS}
 '''

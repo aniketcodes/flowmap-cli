@@ -393,7 +393,7 @@ def index(ctx, repo, full, dry_run):
 @click.option("--limit", default=10, help="Number of results")
 @click.option("--mode", type=click.Choice(["hybrid", "semantic", "keyword", "symbol"]), default="hybrid")
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
-@click.option("--rerank", is_flag=True, default=False, help="Enable cross-encoder reranking (slower, higher quality)")
+@click.option("--rerank", is_flag=True, default=False, help="Rerank the top candidates with the Qwen3 reranker (see reranking config)")
 @click.option("--regex", "use_regex", is_flag=True, default=False, help="Treat keyword query as regex (default: literal match)")
 @click.pass_context
 def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
@@ -493,17 +493,26 @@ def search(ctx, query, repo, limit, mode, fmt, rerank, use_regex):
                 repo_filter=repo,
                 reranking_enabled=rerank or cfg.reranking.enabled,
                 reranking_model=cfg.reranking.model,
+                reranking_backend=cfg.reranking.backend,
+                reranking_ollama_url=cfg.reranking.ollama_url,
                 regex=use_regex,
                 profile=cfg.embedding.profile_name,
             )
 
+            rerank_requested = rerank or cfg.reranking.enabled
+            reranked = None
+            if rerank_requested:
+                from flowmap.search.hybrid import was_reranked
+                reranked = was_reranked(results)
+                if not reranked and fmt != "json":
+                    click.echo("Note: reranking did not run; results are in fusion order (see warning above).", err=True)
             if not results:
                 if fmt == "json":
-                    click.echo(render_hybrid_results([], query, fmt))
+                    click.echo(render_hybrid_results([], query, fmt, reranked=reranked))
                 else:
                     click.echo("No results found.")
                 return
-            click.echo(render_hybrid_results(results, query, fmt))
+            click.echo(render_hybrid_results(results, query, fmt, reranked=reranked))
 
         # --- Semantic only ---
         elif mode == "semantic":
@@ -650,7 +659,6 @@ def cat(ctx, file_path, repo, lines, symbol, fmt):
         sys.exit(1)
 
     repo_cfg = resolved.repo_cfg
-    repo_root = resolved.repo_root
     abs_file = resolved.abs_file
     rel = resolved.rel_file
 

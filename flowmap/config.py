@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -97,7 +98,14 @@ class EmbeddingConfig:
 @dataclass
 class RerankingConfig:
     enabled: bool = False  # Disabled by default — adds ~10s latency. Enable with --rerank flag.
-    model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # Default is Qwen3-Reranker served by Ollama (2026-09-28). On the golden eval it
+    # matches the in-process torch backend (blind prose hit@1 0.36 vs 0.08 unreranked)
+    # while the MS MARCO cross-encoder hurt; it needs no torch/transformers and the
+    # weights stay resident in Ollama. One-time setup: `ollama pull <model>`.
+    # See docs/PLAN_GOLDEN_EVAL_TDD.md.
+    model: str = "hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0"
+    backend: str = "qwen_ollama"  # qwen_ollama (Ollama logprobs) | qwen_direct (in-process transformers, model=Qwen/Qwen3-Reranker-0.6B)
+    ollama_url: str = "http://localhost:11434"  # used by qwen_ollama
 
 
 @dataclass
@@ -201,6 +209,20 @@ def _parse_embedding(emb_raw: dict) -> EmbeddingConfig:
     )
 
 
+def _infer_reranking_backend(model: str) -> str:
+    """Backend for configs that name a model but no `backend` (written before the
+    key existed, or by hand). Hugging Face ids of Qwen rerankers run in-process;
+    everything else (Ollama `name:tag` or `hf.co/...` references) is served by
+    Ollama. Any other bare Hugging Face id is a sentence-transformers
+    cross-encoder from before 2026-09-28; that backend was removed because it
+    ranked worse than no reranking, so such configs get the default instead."""
+    if model.startswith("Qwen/"):
+        return "qwen_direct"
+    if "/" in model and ":" not in model and not model.startswith("hf.co/"):
+        return "legacy_cross_encoder"
+    return "qwen_ollama"
+
+
 def _parse_config_dict(raw: dict) -> FlowmapConfig:
     repos = [
         RepoConfig(name=r["name"], path=r["path"])
@@ -209,10 +231,23 @@ def _parse_config_dict(raw: dict) -> FlowmapConfig:
 
     embedding = _parse_embedding(raw.get("embedding") or {})
 
-    rer_raw = raw.get("reranking", {})
+    rer_raw = raw.get("reranking") or {}
+    rer_model = rer_raw.get("model", RerankingConfig.model)
+    rer_backend = rer_raw.get("backend")
+    if rer_backend is None:
+        rer_backend = _infer_reranking_backend(rer_model)
+        if rer_backend == "legacy_cross_encoder":
+            logging.getLogger(__name__).warning(
+                "reranking.model %r is a cross-encoder; that backend was removed. "
+                "Using %s / %s instead; update ~/.flowmap/config.yaml to silence this.",
+                rer_model, RerankingConfig.backend, RerankingConfig.model,
+            )
+            rer_backend, rer_model = RerankingConfig.backend, RerankingConfig.model
     reranking = RerankingConfig(
         enabled=bool(rer_raw.get("enabled", RerankingConfig.enabled)),
-        model=rer_raw.get("model", RerankingConfig.model),
+        model=rer_model,
+        backend=rer_backend,
+        ollama_url=rer_raw.get("ollama_url", RerankingConfig.ollama_url),
     )
 
     return FlowmapConfig(
@@ -297,8 +332,10 @@ embedding:
   #     model: qwen3-embedding:4b
 
 reranking:
-  enabled: false                        # adds ~10s latency (loads PyTorch). Use --rerank flag for quality-critical queries.
-  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  enabled: false                        # opt-in per query with --rerank (~1-2s with the model resident in Ollama)
+  backend: qwen_ollama                  # one-time: ollama pull hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0
+  model: hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0
+  # alternative: backend qwen_direct + model Qwen/Qwen3-Reranker-0.6B (in-process, needs torch+transformers)
 """
 
 

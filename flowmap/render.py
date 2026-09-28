@@ -9,12 +9,15 @@ import json
 # Search results
 # ---------------------------------------------------------------------------
 
-def render_hybrid_results(results, query: str, fmt: str) -> str:
-    """Format hybrid search results."""
+def render_hybrid_results(results, query: str, fmt: str, reranked: bool | None = None) -> str:
+    """Format hybrid search results. `reranked` (when reranking was requested)
+    says whether a reranker actually reordered them; False means the results
+    are in fusion order and a warning explains why on stderr."""
     if fmt == "json":
         output = {
             "query": query,
             "mode": "hybrid",
+            **({"reranked": reranked} if reranked is not None else {}),
             "results": [
                 {
                     "symbol_name": r.symbol_name,

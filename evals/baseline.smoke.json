@@ -1,0 +1,63 @@
+{
+  "created_at": "2026-09-27T14:47:51+00:00",
+  "flowmap_sha": "edf4fe0b9d16ef7d2a9822aa004a90fd6bec0082",
+  "corpus": {
+    "name": "corpus.smoke",
+    "hash": "6a1b19f781ade9b8",
+    "repos": [
+      {
+        "name": "flowmap",
+        "commit": "edf4fe0b9d16ef7d2a9822aa004a90fd6bec0082"
+      }
+    ]
+  },
+  "model": "qwen3-embedding:0.6b",
+  "flags": {
+    "rerank": false,
+    "limit": 10,
+    "only_type": null,
+    "only_ids": null
+  },
+  "metrics": {
+    "overall": {
+      "n": 12,
+      "hit_at_1": 0.75,
+      "mrr": 0.8035714285714285,
+      "recall_at_5": 0.75,
+      "recall_at_10": 1.0,
+      "file_hit_at_10": 0.3333333333333333
+    },
+    "by_type": {
+      "identifier": {
+        "n": 5,
+        "hit_at_1": 1.0,
+        "mrr": 1.0,
+        "recall_at_5": 1.0,
+        "recall_at_10": 1.0,
+        "file_hit_at_10": 0.0
+      },
+      "mixed": {
+        "n": 2,
+        "hit_at_1": 0.0,
+        "mrr": 0.23809523809523808,
+        "recall_at_5": 0.25,
+        "recall_at_10": 1.0,
+        "file_hit_at_10": 0.5
+      },
+      "natural_language": {
+        "n": 5,
+        "hit_at_1": 0.8,
+        "mrr": 0.8333333333333334,
+        "recall_at_5": 0.7,
+        "recall_at_10": 1.0,
+        "file_hit_at_10": 0.6
+      }
+    },
+    "source_attribution": {
+      "fts": 11,
+      "ripgrep": 4,
+      "semantic": 12,
+      "symbol": 5
+    }
+  }
+}

@@ -1,0 +1,105 @@
+# Smoke golden set over FlowMap itself (see corpus.smoke.yaml).
+# Purpose: prove the harness end to end, not to tune ranking.
+# `type` must agree with flowmap.search.hybrid.classify_query(); the loader checks.
+version: 1
+queries:
+  # --- identifier -----------------------------------------------------------
+  - id: s001
+    query: "classify_query"
+    type: identifier
+    gold:
+      - {repo: flowmap, file: flowmap/search/hybrid.py, symbol: classify_query}
+    notes: "exact function name"
+    confirmed_by: claude
+
+  - id: s002
+    query: "hybrid_search"
+    type: identifier
+    gold:
+      - {repo: flowmap, file: flowmap/search/hybrid.py, symbol: hybrid_search}
+    notes: "exact function name"
+    confirmed_by: claude
+
+  - id: s003
+    query: "StateDB"
+    type: identifier
+    gold:
+      - {repo: flowmap, file: flowmap/state.py, symbol: StateDB}
+    notes: "class name"
+    confirmed_by: claude
+
+  - id: s004
+    query: "load_config"
+    type: identifier
+    gold:
+      - {repo: flowmap, file: flowmap/config.py, symbol: load_config}
+    notes: "exact function name"
+    confirmed_by: claude
+
+  - id: s005
+    query: "VectorStore.search_fts"
+    type: identifier
+    gold:
+      - {repo: flowmap, file: flowmap/store.py, symbol: VectorStore.search_fts}
+    notes: "qualified method name; tests dotted-suffix matching"
+    confirmed_by: claude
+
+  # --- mixed ------------------------------------------------------------------
+  - id: s006
+    query: "where is RRF_K used"
+    type: mixed
+    gold:
+      - {repo: flowmap, file: flowmap/search/hybrid.py, symbol: null}
+    notes: "module constant, not a symbol: file-level gold"
+    confirmed_by: claude
+
+  - id: s007
+    query: "parse embedding profiles in load_config"
+    type: mixed
+    gold:
+      - {repo: flowmap, file: flowmap/config.py, symbol: _parse_embedding, grade: primary}
+      - {repo: flowmap, file: flowmap/config.py, symbol: load_config, grade: acceptable}
+    notes: "_parse_embedding does the work; load_config calls it"
+    confirmed_by: claude
+
+  # --- natural_language --------------------------------------------------------
+  - id: s008
+    query: "fuse ranked results from multiple search sources"
+    type: natural_language
+    gold:
+      - {repo: flowmap, file: flowmap/search/hybrid.py, symbol: hybrid_search}
+    notes: "weighted RRF fusion lives in hybrid_search"
+    confirmed_by: claude
+
+  - id: s009
+    query: "cross-encoder reranking of top candidates"
+    type: natural_language
+    gold:
+      - {repo: flowmap, file: flowmap/search/hybrid.py, symbol: _rerank, grade: primary}
+      - {repo: flowmap, file: flowmap/search/hybrid.py, symbol: hybrid_search, grade: acceptable}
+    notes: "_rerank scores; hybrid_search invokes it on top-30"
+    confirmed_by: claude
+
+  - id: s010
+    query: "list git tracked files respecting gitignore"
+    type: natural_language
+    gold:
+      - {repo: flowmap, file: flowmap/indexer.py, symbol: _git_tracked_files}
+    notes: "git ls-files wrapper"
+    confirmed_by: claude
+
+  - id: s011
+    query: "run ripgrep across repositories"
+    type: natural_language
+    gold:
+      - {repo: flowmap, file: flowmap/search/ripgrep.py, symbol: rg_search}
+    notes: "ripgrep leg entry point"
+    confirmed_by: claude
+
+  - id: s012
+    query: "detect git status for reindex"
+    type: natural_language
+    gold:
+      - {repo: flowmap, file: flowmap/reindex.py, symbol: get_git_status}
+    notes: "returns GitStatus with sha and branch"
+    confirmed_by: claude
