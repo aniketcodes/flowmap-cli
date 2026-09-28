@@ -1,0 +1,13 @@
+# Smoke corpus: FlowMap itself, pinned. Used only to prove the eval harness
+# works end to end. Too small and too single-language to tune ranking on.
+version: 1
+embedding_profile:
+  backend: ollama
+  model: qwen3-embedding:0.6b
+  ollama_url: http://localhost:11434
+repos:
+  - name: flowmap
+    source: ..                      # relative paths resolve against this manifest's directory
+    commit: edf4fe0b9d16ef7d2a9822aa004a90fd6bec0082
+    exclude:
+      - "uv.lock"

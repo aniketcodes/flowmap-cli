@@ -401,8 +401,60 @@ embedding:
 
 reranking:
   enabled: false                         # Enable with --rerank flag instead
-  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  backend: qwen_ollama                   # qwen_ollama | qwen_direct
+  model: hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0   # one-time: ollama pull <model>
 ```
+
+Reranking runs the Qwen3 reranker inside Ollama, so it needs no extra Python
+dependencies; `ollama pull hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0` once.
+`qwen_direct` (model `Qwen/Qwen3-Reranker-0.6B`) runs the same model in-process
+via transformers for machines without Ollama. The earlier MS MARCO cross-encoder
+was removed: on the golden eval it ranked worse than not reranking at all.
+
+### Reranker memory: what to expect and how to fix it
+
+Three distinct things can make reranking look like a memory hog. Each has a
+different cause and fix.
+
+**1. The Ollama runner grows to 8–9 GB (default backend).** Ollama's
+llama-server keeps a host-RAM *prompt cache* (default 8 GB) that saves the KV
+state of every prompt it scores so an identical prompt can be reused later.
+Reranking sends 30 distinct prompts per query and never repeats one, so the
+cache is pure dead weight: it fills to its cap and sits there as idle
+(compressed) pages until the runner exits. Ollama exposes no per-request
+switch, but its bundled server honours an environment variable and the runner
+inherits the Ollama app's environment. Set it, then quit and reopen Ollama:
+
+```bash
+launchctl setenv LLAMA_ARG_CACHE_RAM 0     # 0 = off; or a small cap such as 512
+```
+
+Check it took: the Ollama log (`~/.ollama/logs/server.log`) says
+`prompt cache is disabled`, and the reranker runner stays around 250 MB after
+hundreds of candidates instead of ~9 GB. This applies to every model Ollama
+serves, so chat models lose prompt caching too; use a small cap instead of 0 if
+you notice slower multi-turn chats. Embeddings are unaffected either way.
+
+**2. A 10 GB runner after importing the reranker yourself.** `ollama create`
+from the Hugging Face safetensors produces a bfloat16 model on Ollama's newer
+engine that reserves far more than its 1.2 GB of weights. Don't use that build.
+The pullable GGUF (`hf.co/Mungert/Qwen3-Reranker-0.6B-GGUF:Q8_0`) runs at
+~1.2 GB resident with correct scores; an `ollama create ... --quantize int8`
+import runs at ~0.9 GB and is equally correct. Note that some community GGUF
+builds of this model return no usable logits under Ollama (every token equally
+likely, all scores 0): probe a newly pulled reranker with one `--rerank` search
+and check that `rerank_score` values are not all zero.
+
+**3. The `flowmap` process itself at 10+ GB.** Only with
+`backend: qwen_direct` (in-process torch). That path scores the model's final
+token only and pads inputs to fixed lengths to keep PyTorch's Metal graph cache
+bounded; steady state is ~1.5 GB. If you see more, you are on an older build of
+this code. The default backend does not load torch at all.
+
+FlowMap also caps each candidate at 1,500 characters and asks Ollama for a
+1,280-token context. That keeps the runner's buffers small and keeps batched
+scoring under the length where Ollama's throughput collapses (about 1,000
+prompt tokens on Apple silicon), so a warm reranked search takes ~3 s.
 
 ### Custom config path
 
@@ -510,7 +562,7 @@ Your repos                FlowMap                    Search
 2. Run 3 search channels in parallel: ripgrep, vector similarity, symbol lookup
 3. Map ripgrep line hits to stored chunks (dedup before scoring)
 4. Fuse with weighted Reciprocal Rank Fusion (weights based on query type)
-5. Optional cross-encoder reranking on top-30 candidates
+5. Optional Qwen3 reranking on top-30 candidates
 
 ---
 
@@ -641,6 +693,23 @@ uv run ruff check flowmap/
 - SQL escaping and special character handling
 - Crash recovery (embedding failure preserves data)
 - History/timeline with structural diffs
+- Golden eval scoring and runner plumbing (no Ollama needed)
+
+### Golden retrieval eval
+
+Ranking changes are measured, not guessed. `evals/` holds labeled queries against
+repos pinned to exact commits, run through the real CLI, scored as hit@1 / MRR /
+recall@10 per query type, and diffed against a committed baseline.
+
+```bash
+# smoke set over FlowMap itself (needs Ollama)
+uv run python -m evals.run_eval --corpus evals/corpus.smoke.yaml --golden evals/golden.smoke.yaml
+
+# regression gate, opt-in
+FLOWMAP_GOLDEN=1 uv run pytest -m golden -q
+```
+
+See `evals/README.md` for the file layout, metrics, and how to add a query.
 
 ---
 
